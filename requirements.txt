@@ -1,0 +1,6 @@
+# ADB Macro Studio has NO third-party dependencies.
+# It uses only the Python standard library (tkinter is included with
+# standard CPython on Windows and macOS; on Linux install python3-tk).
+#
+# External requirement: the Android platform-tools 'adb' executable.
+# See the README for install steps.

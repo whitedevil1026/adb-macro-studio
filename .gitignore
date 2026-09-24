@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Runtime / user data (never publish — may contain device serials, evidence, logs)
+cases/
+logs/
+*.log
+
+# Saved macros contain device-specific coordinates/serials — keep them local
+macros/*.json
+!macros/.gitkeep
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
