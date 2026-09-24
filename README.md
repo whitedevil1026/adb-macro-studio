@@ -44,6 +44,35 @@ Verify:
 adb version
 ```
 
+### Already have `adb` in another folder? (point the tool at it)
+You don't have to move it. Tell the tool where it is with the **`ADB_PATH`** variable —
+which must be the **full path to the `adb.exe` file**, not the folder.
+
+Example: adb lives at `D:\tools\platform-tools\adb.exe`, app extracted to `C:\adb-macro-studio`.
+
+**A. Just for this run (Command Prompt):**
+```bat
+cd /d C:\adb-macro-studio
+set ADB_PATH=D:\tools\platform-tools\adb.exe
+python adb_gui.py
+```
+
+**B. Or add the folder to PATH for this run** (here you point at the *folder*):
+```bat
+set PATH=%PATH%;D:\tools\platform-tools
+python adb_gui.py
+```
+
+**C. Set it once, permanently** (`setx` — then open a NEW window):
+```bat
+setx ADB_PATH "D:\tools\platform-tools\adb.exe"
+```
+
+PowerShell equivalent of A: `$env:ADB_PATH = "D:\tools\platform-tools\adb.exe"`.
+macOS/Linux: `export ADB_PATH=/path/to/adb`.
+
+When the app starts, the **Log box** shows the adb it picked (e.g. `adb: D:\tools\platform-tools\adb.exe`) so you can confirm.
+
 ---
 
 ## 2. Get the code
