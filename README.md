@@ -62,6 +62,13 @@ python adb_gui.py
 set PATH=%PATH%;D:\tools\platform-tools
 python adb_gui.py
 ```
+> **What that line means:** `PATH` is the list of folders Windows searches when you type a
+> command like `adb`. Entries are separated by semicolons (`;`). `%PATH%` means "everything
+> already in PATH", so the line reads: *new PATH = (everything already there) + `;` + the adb
+> folder* — it **appends** the folder while keeping the rest.
+> ⚠️ Always include `%PATH%;`. Writing just `set PATH=D:\tools\platform-tools` would **erase**
+> the existing list for that window and break other commands. (This change is temporary — it
+> only affects that one Command Prompt window.)
 
 **C. Set it once, permanently** (`setx` — then open a NEW window):
 ```bat
