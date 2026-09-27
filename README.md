@@ -188,7 +188,14 @@ UI variations without any fixed coordinates.
 
 ---
 
-## 6. Where things are saved
+## 6. Presets (ready-made macros)
+The [`presets/`](presets/) folder ships example macros. Notably
+[`whatsapp_export.json`](presets/whatsapp_export.json) exports a WhatsApp chat/group by
+reading the screen (no coordinates; works for chats and groups), trying with media and
+falling back to without-media if the export popup appears. To use one, copy it into `macros/`
+and **Load** it in the app. See [presets/README.md](presets/README.md) for details.
+
+## 7. Where things are saved
 | Folder | Contents | Published? |
 |--------|----------|------------|
 | `macros/` | Your saved actions & sequences (JSON) | No (git-ignored) |
@@ -197,7 +204,7 @@ UI variations without any fixed coordinates.
 
 ---
 
-## 7. Troubleshooting
+## 8. Troubleshooting
 
 | Symptom | Fix |
 |---------|-----|
@@ -210,5 +217,5 @@ UI variations without any fixed coordinates.
 
 ---
 
-## 8. License
+## 9. License
 MIT — see [LICENSE](LICENSE). No warranty. You are responsible for how you use it.

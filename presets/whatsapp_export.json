@@ -1,0 +1,23 @@
+{
+  "name": "whatsapp_export",
+  "created": "2026-09-26",
+  "is_sequence": false,
+  "note": "Universal WhatsApp chat/group export by reading the screen (no fixed coordinates). Start with the chat OR group already OPEN. Tries WITH media; if the 'Unable to export' popup appears it taps OK and re-exports WITHOUT media. Stops at the share sheet (pick the destination manually for now).",
+  "ref_size": null,
+  "steps": [
+    {"type": "tap_text", "text": "More options", "match": "contains", "timeout": 10, "delay": 1.2, "label": "open 3-dot menu"},
+    {"type": "tap_text", "text": "More", "match": "exact", "timeout": 10, "delay": 1.2, "label": "More"},
+    {"type": "tap_text", "text": "Export chat", "match": "contains", "timeout": 10, "delay": 1.5, "label": "Export chat"},
+    {"type": "tap_text", "text": "Include media", "match": "contains", "timeout": 10, "delay": 1.0, "label": "try WITH media"},
+    {"type": "if_text", "text": "Unable to export", "match": "contains", "timeout": 150, "or_text": "Quick Share", "delay": 0.5, "label": "media export failed?",
+      "then": [
+        {"type": "tap_text", "text": "OK", "match": "exact", "timeout": 10, "delay": 1.2, "label": "dismiss popup"},
+        {"type": "tap_text", "text": "More options", "match": "contains", "timeout": 10, "delay": 1.2, "label": "reopen 3-dot menu"},
+        {"type": "tap_text", "text": "More", "match": "exact", "timeout": 10, "delay": 1.2, "label": "More"},
+        {"type": "tap_text", "text": "Export chat", "match": "contains", "timeout": 10, "delay": 1.5, "label": "Export chat again"},
+        {"type": "tap_text", "text": "Without media", "match": "contains", "timeout": 10, "delay": 1.0, "label": "fallback WITHOUT media"}
+      ],
+      "else": []
+    }
+  ]
+}
