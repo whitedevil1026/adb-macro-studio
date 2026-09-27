@@ -46,6 +46,10 @@ STEP_FIELDS = {
                    ("match", "Match: contains | exact", "contains"), ("timeout", "Timeout (s)", 10.0)],
     "wait_text":  [("text", "Text / description / resource-id", ""),
                    ("match", "Match: contains | exact", "contains"), ("timeout", "Timeout (s)", 10.0)],
+    "if_text":    [("text", "Text to detect on screen", ""),
+                   ("match", "Match: contains | exact", "contains"),
+                   ("timeout", "Max wait (s)", 60.0),
+                   ("or_text", "Else as soon as this text appears", "")],
     "screenshot": [("name", "File label", "screen")],
     "ui_dump":    [("name", "File label", "ui")],
     "pull":       [("remote", "Path on phone", "/sdcard/Android/media/com.whatsapp/WhatsApp"),
@@ -397,6 +401,9 @@ def describe_step(s: dict) -> str:
         return s.get("package", "")
     if t in ("tap_text", "wait_text"):
         return f"\"{s.get('text')}\" ({s.get('match', 'contains')}, up to {s.get('timeout', 10)} s)"
+    if t == "if_text":
+        return (f"if screen shows \"{s.get('text')}\" -> then {len(s.get('then', []))} step(s), "
+                f"else {len(s.get('else', []))} step(s)")
     if t in ("screenshot", "ui_dump"):
         return f"save as '{s.get('name')}'"
     if t == "pull":
@@ -764,8 +771,41 @@ class MacroRunner(threading.Thread):
             self.adb.pull(s["remote"], dest)
             n = self.case.record_tree(dest, f"pulled from {s['remote']}")
             self.emit("log", f"pulled {n} files into {dest}")
+        elif t == "if_text":
+            query = s.get("text", "")
+            match = s.get("match", "contains")
+            or_text = s.get("or_text", "")
+            timeout = float(s.get("timeout", 60))
+            self.emit("log", f"branch: watching for \"{query}\""
+                             + (f"  (else as soon as \"{or_text}\" appears)" if or_text else ""))
+            found = self._branch_wait(query, match, or_text, timeout)
+            branch = s.get("then", []) if found else s.get("else", [])
+            self.emit("log", f"branch -> {'THEN' if found else 'ELSE'} ({len(branch)} step(s))")
+            for sub in branch:
+                if self._stop.is_set():
+                    return
+                self._exec(sub)
+                if self.sleep(sub.get("delay", 0)):
+                    return
         else:
             raise ValueError(f"unknown step type {t!r}")
+
+    def _branch_wait(self, query, match, or_text, timeout) -> bool:
+        """Poll the screen: True as soon as `query` appears, False if `or_text`
+        appears first or the timeout elapses."""
+        deadline = timeout
+        while True:
+            try:
+                nodes = parse_ui_nodes(self.adb.ui_dump())
+                if query and find_node(nodes, query, match):
+                    return True
+                if or_text and find_node(nodes, or_text, "contains"):
+                    return False
+            except AdbError:
+                pass
+            if deadline <= 0 or self.sleep(0.7):
+                return False
+            deadline -= 0.7 + 1.0
 
     def _wait_for(self, query, match, timeout):
         self.adb.log(f"looking for \"{query}\" on screen (uiautomator)")

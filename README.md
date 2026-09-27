@@ -159,8 +159,32 @@ adb devices
 
 ### Step types available
 `tap`, `long_press`, `swipe`, `text`, `key`, `wait`, `launch` (open an app), `tap_text` /
-`wait_text` (find & tap a UI element by text/id — resolution-independent), `screenshot`,
-`ui_dump`, `pull`.
+`wait_text` (find & tap a UI element by text/id — resolution-independent), `if_text`
+(conditional branch — see below), `screenshot`, `ui_dump`, `pull`.
+
+### Conditional branching (`if_text`)
+`if_text` reads the screen and runs one set of steps if a word/phrase appears, another set if
+it doesn't — so a macro can react to popups and different screens. Fields: `text` (what to look
+for), `match` (`contains`/`exact`), `timeout` (how long to watch), and `or_text` (as soon as
+this appears, take the *else* path — avoids waiting the full timeout on the success screen).
+The step carries two nested step lists, `then` and `else`. Example (retry an export "without
+media" only if the "unable to export" popup shows):
+
+```json
+{
+  "type": "if_text", "text": "Unable to export", "match": "contains",
+  "timeout": 120, "or_text": "Quick Share",
+  "then": [
+    {"type": "tap_text", "text": "OK", "delay": 1},
+    {"type": "tap_text", "text": "Export chat", "delay": 1.5},
+    {"type": "tap_text", "text": "Without media", "delay": 1}
+  ],
+  "else": []
+}
+```
+
+Because it taps by **text** (via `uiautomator`), the same macro works across screen sizes and
+UI variations without any fixed coordinates.
 
 ---
 
