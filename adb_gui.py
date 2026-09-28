@@ -39,12 +39,14 @@ from adb_core import (
     find_adb, now_iso, AdbError,
 )
 import queue as _queue
+import whatsapp_batch as wb
 
 BASE = Path(__file__).resolve().parent
 MACRO_DIR = BASE / "macros"
 CASE_DIR = BASE / "cases"
 LOG_DIR = BASE / "logs"
 DEBUG_LOG = LOG_DIR / "gui_session.log"
+BATCH_LOG = LOG_DIR / "batch_session.log"
 CANVAS_W, CANVAS_H = 290, 500
 LIVE_INTERVAL_MS = 800
 
@@ -316,6 +318,286 @@ class SequenceDialog(tk.Toplevel):
         self.destroy()
 
 
+# ------------------------------------------------------------------ batch export window
+class BatchExportWindow(tk.Toplevel):
+    """Scan the WhatsApp chat list, pick chats, export them one by one with live progress."""
+
+    STATUS_TAGS = {"ok": "#0a0", "running": "#06c", "pending": "#888"}
+
+    def __init__(self, app):
+        super().__init__(app.root)
+        self.app = app
+        self.title("WhatsApp batch export")
+        self.geometry("580x640")
+        self.q = _queue.Queue()
+        self.order = []           # full scanned chat order (top -> bottom)
+        self.row_of = {}          # chat name -> tree item id
+        self.batch = None
+        self.scanning = False
+        self.pause_evt = threading.Event()      # set = paused (shared by scan + batch)
+        self.scan_stop = threading.Event()
+
+        top = ttk.Frame(self, padding=6)
+        top.pack(fill="x")
+        self.scan_btn = ttk.Button(top, text="Scan chat list", command=self.scan)
+        self.scan_btn.pack(side="left")
+        ttk.Button(top, text="Select all", command=lambda: self.tree.selection_set(self.tree.get_children())).pack(side="left", padx=4)
+        ttk.Button(top, text="Auto: scan + export", command=self.rolling_start).pack(side="left", padx=4)
+        ttk.Button(top, text="Save list to CSV", command=self.save_csv).pack(side="left", padx=4)
+        self.status_lbl = ttk.Label(top, text="not scanned yet")
+        self.status_lbl.pack(side="left", padx=8)
+
+        mid = ttk.Frame(self, padding=6)
+        mid.pack(fill="both", expand=True)
+        self.tree = ttk.Treeview(mid, columns=("chat", "status"), show="headings",
+                                 selectmode="extended", height=14)
+        self.tree.heading("chat", text="Chat (open WhatsApp to its list, then Scan)")
+        self.tree.heading("status", text="Status")
+        self.tree.column("chat", width=400)
+        self.tree.column("status", width=120, anchor="center")
+        self.tree.pack(side="left", fill="both", expand=True)
+        tsb = ttk.Scrollbar(mid, command=self.tree.yview)
+        tsb.pack(side="left", fill="y")
+        self.tree.config(yscrollcommand=tsb.set)
+        for st, col in self.STATUS_TAGS.items():
+            self.tree.tag_configure(st, foreground=col)
+        self.tree.tag_configure("fail", foreground="#c00")
+
+        pf = ttk.Frame(self, padding=6)
+        pf.pack(fill="x")
+        self.progress_lbl = ttk.Label(pf, text="idle")
+        self.progress_lbl.pack(side="left")
+        self.start_btn = ttk.Button(pf, text="Export selected", command=self.start)
+        self.start_btn.pack(side="right", padx=4)
+        self.resume_btn = ttk.Button(pf, text="Resume pending", command=self.resume_pending)
+        self.resume_btn.pack(side="right", padx=4)
+        self.pause_btn = ttk.Button(pf, text="Pause", command=self.toggle_pause)
+        self.pause_btn.pack(side="right", padx=4)
+        ttk.Button(pf, text="Stop", command=self.stop).pack(side="right")
+
+        lf = ttk.LabelFrame(self, text="Progress log", padding=4)
+        lf.pack(fill="both", expand=False)
+        self.log = tk.Text(lf, height=8, wrap="word")
+        self.log.pack(side="left", fill="both", expand=True)
+        lsb = ttk.Scrollbar(lf, command=self.log.yview)
+        lsb.pack(side="left", fill="y")
+        self.log.config(yscrollcommand=lsb.set, state="disabled")
+
+        if not self.app.adb:
+            messagebox.showinfo("No device", "Connect a device in the main window first.", parent=self)
+        self.after(100, self._pump)
+        self.protocol("WM_DELETE_WINDOW", self._close)
+
+    def _log(self, m):
+        try:
+            with open(BATCH_LOG, "a", encoding="utf-8") as f:
+                f.write(f"{now_iso()}  {m}\n")
+        except Exception:
+            pass
+        self.log.config(state="normal")
+        self.log.insert("end", m + "\n")
+        self.log.see("end")
+        self.log.config(state="disabled")
+
+    def _emit(self, kind, *a):          # called from worker threads
+        self.q.put((kind, a))
+
+    def _tag(self, status):
+        return status if status in self.STATUS_TAGS else ("fail" if status.startswith("fail") else "")
+
+    def scan(self):
+        if not self.app.adb:
+            messagebox.showinfo("No device", "Connect a device first.", parent=self)
+            return
+        if self.scanning:
+            return
+        self.scanning = True
+        self.scan_btn.config(state="disabled")
+        self.status_lbl.config(text="scanning the chat list...")
+        self._log("scanning the chat list...")
+        self.tree.delete(*self.tree.get_children())
+        self.row_of.clear()
+        self.scan_stop.clear()
+        self.pause_evt.clear()
+        self.pause_btn.config(text="Pause")
+
+        def work():
+            try:
+                names = wb.scan_chats(self.app.adb, self.app.cur_size, emit=self._emit,
+                                      pause=self.pause_evt, stop=self.scan_stop)
+                self._emit("scan_done", names)
+            except Exception as e:
+                self._emit("log", f"scan error: {e}")
+                self._emit("scan_done", [])
+        threading.Thread(target=work, daemon=True).start()
+
+    def toggle_pause(self):
+        if self.pause_evt.is_set():
+            self.pause_evt.clear()
+            self.pause_btn.config(text="Pause")
+        else:
+            self.pause_evt.set()
+            self.pause_btn.config(text="Resume")
+
+    def resume_pending(self):
+        pend = [iid for iid in self.tree.get_children()
+                if self.tree.set(iid, "status") == "pending"
+                or self.tree.set(iid, "status").startswith("fail")]
+        if not pend:
+            messagebox.showinfo("Nothing pending", "No pending or failed chats to resume.", parent=self)
+            return
+        self.tree.selection_set(pend)
+        self.start()
+
+    def rolling_start(self):
+        """Auto page-by-page: scan a screenful, export the undone ones, scroll, repeat. Writes CSV."""
+        if not self.app.adb:
+            messagebox.showinfo("No device", "Connect a device first.", parent=self)
+            return
+        if self.batch and self.batch.is_alive():
+            messagebox.showinfo("Busy", "A run is already in progress.", parent=self)
+            return
+        if not self.app.case:
+            self.app.case = CaseLog(CASE_DIR, self.app.serial or "unknown")
+        self.tree.delete(*self.tree.get_children())
+        self.row_of.clear()
+        self.order = []
+        self.pause_evt.clear()
+        self.pause_btn.config(text="Pause")
+        if getattr(self.app, "_live_pause", None):
+            self.app._live_pause.set()
+        self.start_btn.config(state="disabled")
+        self.batch = wb.RollingBatch(self.app.adb, self.app.case, self.app.cur_size,
+                                     self._emit, pause=self.pause_evt)
+        self._log("AUTO scan + export starting (page by page)")
+        self._log(f"CSV file: {self.batch.csv_path}")
+        self.batch.start()
+
+    def save_csv(self):
+        rows = [(self.tree.item(iid, "values")[0], self.tree.item(iid, "values")[1])
+                for iid in self.tree.get_children()]
+        if not rows:
+            messagebox.showinfo("Empty", "Scan the chat list first (nothing to save).", parent=self)
+            return
+        from tkinter import filedialog
+        path = filedialog.asksaveasfilename(parent=self, defaultextension=".csv",
+                                            filetypes=[("CSV files", "*.csv")],
+                                            initialfile="whatsapp_chats.csv")
+        if not path:
+            return
+        try:
+            wb.save_names_csv(rows, path)
+            self._log(f"saved chat list ({len(rows)} rows) -> {path}")
+            messagebox.showinfo("Saved", f"Chat list saved to:\n{path}", parent=self)
+        except Exception as e:
+            messagebox.showerror("Save failed", str(e), parent=self)
+
+    def start(self):
+        if not self.app.adb:
+            messagebox.showinfo("No device", "Connect a device first.", parent=self)
+            return
+        if self.batch and self.batch.is_alive():
+            messagebox.showinfo("Busy", "A batch is already running.", parent=self)
+            return
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showinfo("Pick chats", "Select one or more chats first (Ctrl/Shift-click, or Select all).", parent=self)
+            return
+        chosen = {self.tree.item(iid, "values")[0] for iid in sel}
+        names = [n for n in self.order if n in chosen]     # keep scanned order
+        for iid in self.tree.get_children():
+            nm = self.tree.item(iid, "values")[0]
+            st = "pending" if nm in chosen else ""
+            self.tree.set(iid, "status", st)
+            self.tree.item(iid, tags=(self._tag(st),))
+        if not self.app.case:
+            self.app.case = CaseLog(CASE_DIR, self.app.serial or "unknown")
+        if getattr(self.app, "_live_pause", None):
+            self.app._live_pause.set()          # let the batch own the screen
+        self.pause_evt.clear()
+        self.pause_btn.config(text="Pause")
+        self.start_btn.config(state="disabled")
+        self._log(f"starting batch over {len(names)} chat(s)")
+        self.batch = wb.WhatsAppBatch(self.app.adb, self.app.case, self.app.cur_size,
+                                      names, self.order, self._emit, pause=self.pause_evt)
+        self.batch.start()
+
+    def stop(self):
+        self.scan_stop.set()                 # stop a running scan
+        if self.batch:
+            self.batch.stop()                # stop the batch AND its current export
+        self._log("STOP pressed - halting now...")
+
+    def _pump(self):
+        try:
+            while True:
+                kind, a = self.q.get_nowait()
+                if kind == "scan_progress":
+                    self.status_lbl.config(text=f"scanning... {a[0]} chats so far")
+                elif kind == "scan_done":
+                    self.order = a[0]
+                    for nm in self.order:
+                        iid = self.tree.insert("", "end", values=(nm, "pending"), tags=("pending",))
+                        self.row_of[nm] = iid
+                    self.status_lbl.config(text=f"{len(self.order)} chats - select some and click Export selected")
+                    self._log(f"scan done: {len(self.order)} chats found")
+                    self.scanning = False
+                    self.scan_btn.config(state="normal")
+                elif kind == "discover":
+                    name = a[0]
+                    if name not in self.row_of:
+                        iid = self.tree.insert("", "end", values=(name, "pending"), tags=("pending",))
+                        self.row_of[name] = iid
+                        self.order.append(name)
+                        self.tree.see(iid)
+                elif kind == "row":
+                    name, status = a
+                    iid = self.row_of.get(name)
+                    if iid:
+                        self.tree.set(iid, "status", status)
+                        self.tree.item(iid, tags=(self._tag(status),))
+                        self.tree.see(iid)
+                    self.progress_lbl.config(text=f"{name}  ->  {status}")
+                elif kind == "progress":
+                    i, total, name, status = a
+                    self.progress_lbl.config(text=f"{i}/{total}: {name}  ->  {status}")
+                    iid = self.row_of.get(name)
+                    if iid:
+                        self.tree.set(iid, "status", status)
+                        self.tree.item(iid, tags=(self._tag(status),))
+                        self.tree.see(iid)
+                elif kind == "log":
+                    self._log(a[0])
+                elif kind == "finished":
+                    summ = a[0]
+                    if "csv" in summ:                      # rolling auto run
+                        self.progress_lbl.config(text=f"done - {summ['exported']}/{summ['total']} exported")
+                        self._log(f"FINISHED (auto): {summ['exported']}/{summ['total']} exported. CSV: {summ['csv']}")
+                    else:
+                        results = summ.get("results", [])
+                        ok = sum(1 for _, s in results if s == "ok")
+                        self.progress_lbl.config(text=f"done - {ok}/{len(results)} ok")
+                        self._log(f"FINISHED: {ok}/{len(results)} exported OK. Last exported: {summ.get('last')}")
+                    self.start_btn.config(state="normal")
+                    if getattr(self.app, "_live_pause", None):
+                        self.app._live_pause.clear()
+        except _queue.Empty:
+            pass
+        self.after(100, self._pump)
+
+    def _close(self):
+        if self.batch:
+            self.batch.stop()
+        self.scan_stop.set()
+        try:
+            wb.keep_awake(self.app.adb, False)      # restore normal screen timeout
+        except Exception:
+            pass
+        if getattr(self.app, "_live_pause", None):
+            self.app._live_pause.clear()
+        self.destroy()
+
+
 # ------------------------------------------------------------------ main app
 class App:
     def __init__(self, root: tk.Tk):
@@ -429,6 +711,9 @@ class App:
         ttk.Button(macf, text="Build sequence from actions...",
                    command=self.build_sequence).grid(row=2, column=0, columnspan=3,
                                                       pady=(6, 0), sticky="ew")
+        ttk.Button(macf, text="WhatsApp batch export...",
+                   command=self.open_batch_export).grid(row=3, column=0, columnspan=3,
+                                                        pady=(4, 0), sticky="ew")
 
         playf = ttk.LabelFrame(right, text="Playback", padding=6)
         playf.pack(fill="x", pady=4)
@@ -797,6 +1082,12 @@ class App:
         if self.macro_ref_size and tuple(self.macro_ref_size) != self.cur_size and self.cur_size != (0, 0):
             note = f" (will scale {self.macro_ref_size} -> {list(self.cur_size)})"
         self._log(f"loaded '{macro['name']}' with {len(self.steps)} steps{note}")
+
+    def open_batch_export(self):
+        if not self.adb:
+            messagebox.showinfo("No device", "Connect a device first.")
+            return
+        BatchExportWindow(self)
 
     def build_sequence(self):
         dlg = SequenceDialog(self.root, self)

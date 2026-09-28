@@ -567,21 +567,30 @@ class Adb:
         png_size(data)
         return data
 
-    def ui_dump(self) -> str:
-        """UI hierarchy XML. Tries stdout first so nothing is written on the phone."""
-        try:
-            out = self.run("exec-out", "uiautomator", "dump", "/dev/tty", timeout=30, quiet=True)
-            text = out.decode("utf-8", "replace")
-            if "<hierarchy" in text:
-                return text
-        except AdbError:
-            pass
-        remote = "/sdcard/window_dump.xml"
-        self.log("uiautomator could not write to stdout; using " + remote + " (deleted after)")
-        self.shell("uiautomator", "dump", remote, timeout=30)
-        text = self.run("exec-out", "cat", remote, quiet=True).decode("utf-8", "replace")
-        self.shell("rm", "-f", remote)
-        return text
+    def ui_dump(self, retries=3) -> str:
+        """UI hierarchy XML. Tries stdout first (writes nothing on the phone). Retries with
+        backoff because uiautomator can be SIGKILLed (exit 137) when the phone is busy
+        (e.g. preparing a media export)."""
+        last = ""
+        for attempt in range(retries):
+            try:                                  # primary: stream to stdout
+                out = self.run("exec-out", "uiautomator", "dump", "/dev/tty", timeout=30, quiet=True)
+                text = out.decode("utf-8", "replace")
+                if "<hierarchy" in text:
+                    return text
+            except AdbError as e:
+                last = str(e)
+            try:                                  # fallback: dump to a file, read it back
+                remote = "/sdcard/window_dump.xml"
+                self.shell("uiautomator", "dump", remote, timeout=30, quiet=True)
+                text = self.run("exec-out", "cat", remote, quiet=True).decode("utf-8", "replace")
+                self.shell("rm", "-f", remote, quiet=True)
+                if "<hierarchy" in text:
+                    return text
+            except AdbError as e:
+                last = str(e)
+            time.sleep(1.0 + attempt)             # back off (phone busy) before retrying
+        raise AdbError("uiautomator dump failed after retries: " + last)
 
     # --- input
     def tap(self, x, y):
@@ -803,9 +812,9 @@ class MacroRunner(threading.Thread):
                     return False
             except AdbError:
                 pass
-            if deadline <= 0 or self.sleep(0.7):
+            if deadline <= 0 or self.sleep(1.0):
                 return False
-            deadline -= 0.7 + 1.0
+            deadline -= 1.0 + 1.2
 
     def _wait_for(self, query, match, timeout):
         self.adb.log(f"looking for \"{query}\" on screen (uiautomator)")
@@ -817,6 +826,6 @@ class MacroRunner(threading.Thread):
                     return node
             except AdbError as e:  # "could not get idle state" while the screen animates
                 self.emit("log", f"UI dump retry: {e}")
-            if deadline <= 0 or self.sleep(0.7):
+            if deadline <= 0 or self.sleep(1.0):
                 raise TimeoutError(f"\"{query}\" not found on screen within {timeout:g} s")
-            deadline -= 0.7 + 1.0  # sleep + typical dump time
+            deadline -= 1.0 + 1.2  # sleep + typical dump time
