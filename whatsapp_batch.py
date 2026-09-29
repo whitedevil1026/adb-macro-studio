@@ -344,18 +344,21 @@ class WhatsAppBatch(threading.Thread):
         self._runner = None                        # current inner export runner
         self.pc_name, self.save_dir = pc_name, save_dir
         self.files = {}                            # name -> (filename, sha256, media)
+        self.times = {}                            # name -> ISO time the row became terminal
         self.csv_path = str(Path(case.dir) / "exported_chats.csv")
         self.last_done = None
         self.results = []
 
     def _write_csv(self):
         try:
+            now = core.now_iso()
             with open(self.csv_path, "w", newline="", encoding="utf-8") as f:
                 wr = csv.writer(f)
                 wr.writerow(["#", "chat", "status", "media", "saved_file", "sha256", "time"])
                 for i, (nm, st) in enumerate(self.results, 1):
+                    self.times.setdefault(nm, now)   # stamp on first write = completion time
                     fn, digest, media = self.files.get(nm, ("", "", ""))
-                    wr.writerow([i, _csv_safe(nm), st, media, _csv_safe(fn), digest, core.now_iso()])
+                    wr.writerow([i, _csv_safe(nm), st, media, _csv_safe(fn), digest, self.times[nm]])
         except Exception as e:
             self.emit("log", f"csv write failed: {e}")
 
@@ -489,6 +492,7 @@ class WhatsAppBatch(threading.Thread):
                     except core.AdbError:
                         pass
         finally:
+            self._write_csv()          # guarantee the final state (incl. a last failure) is saved
             self.emit("finished", {"last": self.last_done, "results": self.results})
 
 
@@ -532,7 +536,8 @@ class RollingBatch(threading.Thread):
         self._pause = pause or threading.Event()
         self._runner = None       # current inner export runner
         self.status = {}          # name -> status
-        self.files = {}           # name -> (filename, sha256)
+        self.files = {}           # name -> (filename, sha256, media)
+        self.times = {}           # name -> ISO time the row became terminal
         self.order = []           # discovery order
         self.pc_name, self.save_dir = pc_name, save_dir
         self.csv_path = str(csv_path) if csv_path else str(Path(case.dir) / "exported_chats.csv")
@@ -585,13 +590,17 @@ class RollingBatch(threading.Thread):
 
     def _write_csv(self):
         try:
+            now = core.now_iso()
             with open(self.csv_path, "w", newline="", encoding="utf-8") as f:
                 wr = csv.writer(f)
                 wr.writerow(["#", "chat", "status", "media", "saved_file", "sha256", "time"])
                 for i, nm in enumerate(self.order, 1):
+                    st = self.status.get(nm, "")
+                    if st and st not in ("pending", "running"):   # terminal -> stamp once
+                        self.times.setdefault(nm, now)
                     fn, digest, media = self.files.get(nm, ("", "", ""))
-                    wr.writerow([i, _csv_safe(nm), self.status.get(nm, ""), media,
-                                 _csv_safe(fn), digest, core.now_iso()])
+                    wr.writerow([i, _csv_safe(nm), st, media,
+                                 _csv_safe(fn), digest, self.times.get(nm, "")])
         except Exception as e:
             self.emit("log", f"csv write failed: {e}")
 
