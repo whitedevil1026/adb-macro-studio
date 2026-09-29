@@ -1,6 +1,11 @@
-# ADB Macro Studio has NO third-party dependencies.
-# It uses only the Python standard library (tkinter is included with
-# standard CPython on Windows and macOS; on Linux install python3-tk).
+# ADB Macro Studio's CORE runs on the Python standard library alone — recording, replay,
+# screen-reading export, Quick Share send, CSV + SHA-256 all work with no pip install.
+# (tkinter ships with standard CPython on Windows/macOS; on Linux install python3-tk.)
 #
-# External requirement: the Android platform-tools 'adb' executable.
-# See the README for install steps.
+# External requirement: the Android platform-tools 'adb' executable. See the README.
+#
+# The one dependency below is ONLY for hands-off auto-Accept of incoming Quick Share
+# transfers on Windows. `pip install -r requirements.txt` installs it so the batch run is
+# fully hands-off. Delete this line if you'd rather add nothing and click Accept yourself —
+# everything else still works exactly the same.
+pywinauto ; sys_platform == "win32"

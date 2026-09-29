@@ -211,9 +211,14 @@ Bluetooth and Wi-Fi are switched on). Every saved file is SHA-256 hashed and log
    - **PC name** — exactly as the phone sees this PC in the Quick Share device list.
    - **Save folder** — the same folder Quick Share for Windows saves incoming files to.
 
-> The app auto-clicks the Windows Quick Share **Accept** button for you (via UI automation), so
-> the whole run is hands-off. If your Windows is not in English, adjust the accept label in
-> `qs_accept.py` (`ACCEPT_LABELS`).
+> **Hands-off Accept (optional):** the app can auto-click the Windows Quick Share **Accept**
+> button for you, but that needs the third-party **`pywinauto`** package:
+> ```bash
+> pip install pywinauto
+> ```
+> **Without it the tool still works** — the export and Quick Share send run normally and the file
+> is still received and hashed — you just click **Accept** yourself on each transfer. If your
+> Windows is not in English, adjust the accept label in `qs_accept.py` (`ACCEPT_LABELS`).
 
 ### How the rolling export works
 It does **not** pre-scan the whole list. Instead it reads the chats currently on screen, exports
