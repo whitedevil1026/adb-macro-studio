@@ -592,9 +592,14 @@ class RollingBatch(threading.Thread):
 
     def _swipe_down(self):
         w, h = self.size
-        # gentle partial-page scroll (~30% of the screen, slower stroke): smoother than a
-        # full fling and keeps a big overlap so no chat between pages is ever skipped.
-        self.adb.swipe(w // 2, int(h * 0.70), w // 2, int(h * 0.42), 350); time.sleep(0.5)
+        # Scroll strictly inside the MIDDLE band of the screen, centred on h/2, so the gesture
+        # never reaches the bottom "home" area (which minimises/closes WhatsApp) or the top bar.
+        # Symmetric around the middle (0.60h -> 0.40h = ~20% of the screen), horizontally centred,
+        # with a slow ~600ms stroke so it drags (no fling momentum that would skip chats). Small
+        # enough to keep big overlap, large enough to always advance. Uses the live w/h read from
+        # the device on connect, so it adapts to any resolution.
+        cx = w // 2
+        self.adb.swipe(cx, int(h * 0.60), cx, int(h * 0.40), 600); time.sleep(0.6)
 
     def _write_csv(self):
         try:
