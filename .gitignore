@@ -20,3 +20,6 @@ macros/*.json
 Thumbs.db
 .idea/
 .vscode/
+
+# device-specific learned tap coordinates
+.qs_coords.json
