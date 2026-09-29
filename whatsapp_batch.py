@@ -361,6 +361,8 @@ class WhatsAppBatch(threading.Thread):
                 for i, (nm, st) in enumerate(self.results, 1):
                     self.times.setdefault(nm, now)   # stamp on first write = completion time
                     fn, digest, media = self.files.get(nm, ("", "", ""))
+                    if not media and st.startswith("fail"):
+                        media = "not exported"       # chat never opened -> no media choice made
                     wr.writerow([i, _csv_safe(nm), st, media, _csv_safe(fn), digest, self.times[nm]])
         except Exception as e:
             self.emit("log", f"csv write failed: {e}")
@@ -603,6 +605,8 @@ class RollingBatch(threading.Thread):
                     if st and st not in ("pending", "running"):   # terminal -> stamp once
                         self.times.setdefault(nm, now)
                     fn, digest, media = self.files.get(nm, ("", "", ""))
+                    if not media and st.startswith("fail"):
+                        media = "not exported"       # chat never opened -> no media choice made
                     wr.writerow([i, _csv_safe(nm), st, media,
                                  _csv_safe(fn), digest, self.times.get(nm, "")])
         except Exception as e:
