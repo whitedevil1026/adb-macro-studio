@@ -592,7 +592,9 @@ class RollingBatch(threading.Thread):
 
     def _swipe_down(self):
         w, h = self.size
-        self.adb.swipe(w // 2, int(h * 0.78), w // 2, int(h * 0.33), 220); time.sleep(0.4)
+        # gentle partial-page scroll (~30% of the screen, slower stroke): smoother than a
+        # full fling and keeps a big overlap so no chat between pages is ever skipped.
+        self.adb.swipe(w // 2, int(h * 0.70), w // 2, int(h * 0.42), 350); time.sleep(0.5)
 
     def _write_csv(self):
         try:
