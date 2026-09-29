@@ -473,8 +473,9 @@ class WhatsAppBatch(threading.Thread):
                         outer_stop=self._stop, on_runner=self._set_runner,
                         pc_name=self.pc_name, save_dir=self.save_dir,
                         deadline=time.time() + MAX_SEND_SECONDS)
-                    self.files[name] = (Path(path).name if path else "", digest or "",
-                                        media if status == "ok" else "")
+                    # record the media mode that was chosen even if the send later failed
+                    # (blank only if we never reached the with/without-media choice)
+                    self.files[name] = (Path(path).name if path else "", digest or "", media)
                     if self._stop.is_set():
                         self.emit("progress", i, total, name, "stopped"); break
                     self.emit("progress", i, total, name, status)
@@ -615,8 +616,9 @@ class RollingBatch(threading.Thread):
             outer_stop=self._stop, on_runner=self._set_runner,
             pc_name=self.pc_name, save_dir=self.save_dir,
             deadline=time.time() + MAX_SEND_SECONDS)
-        self.files[name] = (Path(path).name if path else "", digest or "",
-                            media if status == "ok" else "")
+        # record the media mode that was chosen even if the send later failed
+        # (blank only if we never reached the with/without-media choice)
+        self.files[name] = (Path(path).name if path else "", digest or "", media)
         return status
 
     def run(self):

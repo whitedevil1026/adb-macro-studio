@@ -246,7 +246,7 @@ it's always current — even mid-run and even for failures. Columns:
 | `#` | Row number in discovery order |
 | `chat` | Chat/group name (sanitised against spreadsheet formula injection) |
 | `status` | `ok`, or a `fail-*` reason (see below), `pending`, `running`, `stopped` |
-| `media` | `with media` / `without media` (blank unless the row succeeded) |
+| `media` | `with media` / `without media` — the path taken during export, recorded even if the send later failed (blank only if it failed before that choice) |
 | `saved_file` | Filename received on the PC |
 | `sha256` | Hash of the received file |
 | `time` | When **that** chat finished (frozen per row, not the last-write time) |
