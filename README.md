@@ -195,16 +195,83 @@ reading the screen (no coordinates; works for chats and groups), trying with med
 falling back to without-media if the export popup appears. To use one, copy it into `macros/`
 and **Load** it in the app. See [presets/README.md](presets/README.md) for details.
 
-## 7. Where things are saved
+## 7. Batch export WhatsApp chats to the PC (Quick Share)
+
+For bulk logical extraction, the app can walk **every** WhatsApp chat and save each export
+straight to this PC over **Quick Share** — no cloud, no cable copy, and it works fully
+**offline** (Quick Share uses Bluetooth + Wi-Fi Direct, so it runs in airplane mode as long as
+Bluetooth and Wi-Fi are switched on). Every saved file is SHA-256 hashed and logged to a CSV.
+
+### One-time setup
+1. Install **Quick Share for Windows** on the PC and sign in; set it to **receive** and choose a
+   **save folder** (e.g. `Downloads` or a case folder).
+2. On the phone, make sure **Quick Share** is available in WhatsApp's share sheet and that the PC
+   shows up as a nearby device (Bluetooth **and** Wi-Fi on, on both).
+3. In the app's batch window, set two fields to match your setup:
+   - **PC name** — exactly as the phone sees this PC in the Quick Share device list.
+   - **Save folder** — the same folder Quick Share for Windows saves incoming files to.
+
+> The app auto-clicks the Windows Quick Share **Accept** button for you (via UI automation), so
+> the whole run is hands-off. If your Windows is not in English, adjust the accept label in
+> `qs_accept.py` (`ACCEPT_LABELS`).
+
+### How the rolling export works
+It does **not** pre-scan the whole list. Instead it reads the chats currently on screen, exports
+the ones not done yet, scrolls down, and repeats to the bottom — so it starts working immediately
+and survives lists of hundreds of chats. Per chat it:
+
+1. Opens the chat and exports it, **trying "with media" first** and automatically falling back to
+   **"without media"** if WhatsApp says the export is too large.
+2. Shares the resulting file to this PC via **Quick Share**, waits for it to land in the save
+   folder, and records its **SHA-256**.
+3. Writes a row to the CSV, then moves to the next chat.
+
+**Buttons:** *Scan* (see what's on screen), *Auto* (rolling scan+export), *Pause/Resume*,
+*Resume pending* (retry rows still pending or failed), *Save CSV*, and *Stop* (halts within a few
+seconds — it also interrupts an in-progress export).
+
+### Skip chats that take too long
+Some very large chats make the phone too busy for the screen-reader (Android can even kill the
+UI-dump helper under memory pressure). To stop one chat from stalling the whole run, each chat has
+a time budget — **`MAX_SEND_SECONDS`** in `whatsapp_batch.py` (default **180 s**) — to reach the
+"sent" point. If it's exceeded, the chat is marked **`fail-timeout`** in the CSV and the batch
+moves on. (The file transfer itself keeps a separate, longer timeout.)
+
+### The CSV (audit log)
+Written to `cases/<timestamp>_<serial>/exported_chats.csv` and **rewritten after every chat**, so
+it's always current — even mid-run and even for failures. Columns:
+
+| Column | Meaning |
+|--------|---------|
+| `#` | Row number in discovery order |
+| `chat` | Chat/group name (sanitised against spreadsheet formula injection) |
+| `status` | `ok`, or a `fail-*` reason (see below), `pending`, `running`, `stopped` |
+| `media` | `with media` / `without media` (the path taken during export, recorded even if the send later failed), or `not exported` when the chat never opened. Blank only while a row is still `pending`/`running`. |
+| `saved_file` | Filename received on the PC |
+| `sha256` | Hash of the received file |
+| `time` | When **that** chat finished (frozen per row, not the last-write time) |
+
+Common `status` values: `ok`, `fail-export` (couldn't produce the file), `fail-timeout` (over the
+per-chat budget), `fail-transfer` (file never arrived), `fail-noshare`/`fail-pcpick` (couldn't find
+Quick Share or this PC in the picker), `fail-notfound` (chat row not found), `fail-device` (phone
+disconnected too long).
+
+> **Limitation:** chats are tracked by display name. Two chats with the **identical** name are
+> de-duplicated — only the first is exported. Rename one on the phone if you need both.
+
+---
+
+## 8. Where things are saved
 | Folder | Contents | Published? |
 |--------|----------|------------|
 | `macros/` | Your saved actions & sequences (JSON) | No (git-ignored) |
-| `cases/`  | Per-device case folder: `session.log`, `hashes.csv`, pulled files, screenshots | No |
+| `cases/`  | Per-device case folder: `session.log`, `hashes.csv`, `exported_chats.csv`, pulled files, screenshots | No |
+| Quick Share save folder | The exported chat `.zip` files received on the PC | No (outside the repo) |
 | `logs/`   | GUI session/debug log | No |
 
 ---
 
-## 8. Troubleshooting
+## 9. Troubleshooting
 
 | Symptom | Fix |
 |---------|-----|
@@ -214,8 +281,11 @@ and **Load** it in the app. See [presets/README.md](presets/README.md) for detai
 | Live screen is black | Make sure the phone is **unlocked** and the connection is stable. |
 | Auto-capture finds no touchscreen | Ensure the device is connected/authorized; the app auto-selects the real touchscreen node. |
 | Taps land in the wrong place on another phone | Re-record, or rely on the auto-scaling (macros store the recording resolution). For maximum robustness use `tap_text` (element-based) steps. |
+| Batch export: files never arrive on the PC | Check **PC name** and **save folder** match Quick Share for Windows; confirm Bluetooth **and** Wi-Fi are on for both devices and the PC appears in the phone's Quick Share list. |
+| Batch export: a chat shows `fail-timeout` | The chat was too large to reach "sent" within `MAX_SEND_SECONDS` (default 180). Increase it in `whatsapp_batch.py`, or export that one chat manually. |
+| Batch export: Accept isn't auto-clicked | Non-English Windows — set the button label in `qs_accept.py` (`ACCEPT_LABELS`). |
 
 ---
 
-## 9. License
+## 10. License
 MIT — see [LICENSE](LICENSE). No warranty. You are responsible for how you use it.

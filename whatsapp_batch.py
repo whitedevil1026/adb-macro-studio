@@ -10,11 +10,42 @@ from __future__ import annotations
 
 import copy
 import csv
+import json
 import threading
 import time
 from pathlib import Path
 
 import adb_core as core
+import bt_transfer as bt
+try:
+    import qs_accept
+except Exception:
+    qs_accept = None
+
+# --- Quick Share transfer config (editable) ---
+# Set these to your own values (or edit them in the batch window's fields at runtime):
+PC_NAME = "YOUR-PC-NAME"                    # the PC's Quick Share device name (shown on the phone)
+SAVE_DIR = str(Path.home() / "Downloads")  # folder where the PC's Quick Share saves received files
+
+# If getting a chat to the "sent" point (export + reach share sheet + pick PC) takes longer
+# than this, give up on it, mark it fail-timeout in the CSV, and move to the next chat.
+# This is what stops a mega-chat (e.g. one that starves the screen-reader) from hanging the run.
+MAX_SEND_SECONDS = 180                      # the actual file transfer keeps its own longer timeout
+
+# Learned tap positions for "Quick Share" and the PC, per screen size. On a mega-chat the
+# phone is too busy for uiautomator to read the share sheet, so we fall back to these.
+_COORD_FILE = Path(__file__).resolve().parent / ".qs_coords.json"
+def _load_coords():
+    try:
+        return json.loads(_COORD_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+_COORDS = _load_coords()
+def _save_coords():
+    try:
+        _COORD_FILE.write_text(json.dumps(_COORDS), encoding="utf-8")
+    except Exception:
+        pass
 
 CONTACT_ID = "conversations_row_contact_name"     # WhatsApp chat-name node
 LIST_MARKER = "Ask Meta AI or Search"             # present on the chat list
@@ -26,7 +57,7 @@ EXPORT_STEPS = [
     {"type": "tap_text", "text": "More", "match": "exact", "timeout": 8, "delay": 0.6},
     {"type": "tap_text", "text": "Export chat", "match": "contains", "timeout": 8, "delay": 0.7},
     {"type": "tap_text", "text": "Include media", "match": "contains", "timeout": 8, "delay": 0.5},
-    {"type": "if_text", "text": "Unable to export", "match": "contains", "timeout": 120,
+    {"type": "if_text", "text": "Unable to export", "match": "contains", "timeout": 300,
      "or_text": "Quick Share", "delay": 0.3,
      "then": [
          {"type": "tap_text", "text": "OK", "match": "exact", "timeout": 8, "delay": 0.6},
@@ -138,7 +169,7 @@ def scan_chats(adb, size, emit=None, max_scrolls=60, pause=None, stop=None):
 
 
 # ----------------------------------------------------------------- one export
-def _run_steps(adb, case, size, steps, emit_log, outer_stop=None, on_runner=None, limit=220):
+def _run_steps(adb, case, size, steps, emit_log, outer_stop=None, on_runner=None, limit=420):
     done = threading.Event(); res = {}
     def em(kind, *a):
         if kind == "log":
@@ -161,6 +192,141 @@ def _run_steps(adb, case, size, steps, emit_log, outer_stop=None, on_runner=None
     return res.get("r", "stopped")
 
 
+# ----------------------------------------------------------------- send helpers
+def _tap_text(adb, text, timeout=12, match="contains", delay=1.0, stop=None):
+    end = time.time() + timeout
+    while time.time() < end:
+        if stop is not None and stop.is_set():
+            return False
+        n = core.find_node(_nodes(adb), text, match)
+        if n:
+            adb.tap(*core.node_center(n)); time.sleep(delay); return True
+        time.sleep(1.0)
+    return False
+
+
+def _wait_text(adb, text, timeout=30, match="contains", stop=None):
+    end = time.time() + timeout
+    while time.time() < end:
+        if stop is not None and stop.is_set():
+            return False
+        if core.find_node(_nodes(adb), text, match):
+            return True
+        time.sleep(1.0)
+    return False
+
+
+def _wait_node(adb, text, timeout=30, match="contains", stop=None):
+    """Like _wait_text but returns the matching node (or None)."""
+    end = time.time() + timeout
+    while time.time() < end:
+        if stop is not None and stop.is_set():
+            return None
+        n = core.find_node(_nodes(adb), text, match)
+        if n:
+            return n
+        time.sleep(1.0)
+    return None
+
+
+def _back_to_list(adb, tries=6):
+    for _ in range(tries):
+        if on_chat_list(adb):
+            return True
+        adb.key("BACK"); time.sleep(1.2)
+    # last resort: bring WhatsApp back to the front
+    try:
+        adb.launch("com.whatsapp"); time.sleep(2.0)
+    except core.AdbError:
+        pass
+    for _ in range(4):
+        if on_chat_list(adb):
+            return True
+        adb.key("BACK"); time.sleep(1.2)
+    return on_chat_list(adb)
+
+
+def export_and_send(adb, case, size, emit_log=lambda m: None, outer_stop=None,
+                    on_runner=None, pc_name=PC_NAME, save_dir=SAVE_DIR, auto_accept=True,
+                    deadline=None):
+    """Open chat is assumed already. Export (media -> fallback), send via Quick Share to
+    `pc_name`, wait for the file on the PC, hash it, then navigate back to the chat list.
+    `deadline` (epoch seconds) caps the time to reach the 'sent' point; if it's blown we give
+    up with 'fail-timeout' and move on (so a mega-chat can't hang the batch). The transfer
+    itself keeps its own longer timeout.
+    Returns (status, file_path_or_None, sha256_or_None, media_mode)."""
+    def _left():
+        return (deadline - time.time()) if deadline else 1e9
+    # the flow always ATTEMPTS with-media first (it taps "Include media"), so default to that.
+    # the branch only downgrades to "without media" if WhatsApp rejects the media export.
+    # => the media column is filled for every chat that reaches the export screen, pass or fail.
+    media = {"mode": "with media"}
+    def _log(m):
+        if "branch -> THEN" in m:
+            media["mode"] = "without media"     # media too big -> fell back
+        elif "branch -> ELSE" in m:
+            media["mode"] = "with media"        # Include media succeeded
+        emit_log(m)
+    reason = _run_steps(adb, case, size, copy.deepcopy(EXPORT_STEPS), _log,
+                        outer_stop=outer_stop, on_runner=on_runner,
+                        limit=max(5, min(420, _left())))
+    if outer_stop is not None and outer_stop.is_set():
+        return "stopped", None, None, media["mode"]
+    if _left() <= 0:
+        emit_log("took too long to export - skipping (fail-timeout)")
+        _back_to_list(adb); return "fail-timeout", None, None, media["mode"]
+    if not reason.startswith("done"):
+        _back_to_list(adb)
+        return "fail-export", None, None, media["mode"]
+    key = f"{size[0]}x{size[1]}"
+    cached = _COORDS.get(key, {})
+    blind = False                              # did we fall back to a learned position?
+
+    # --- find & tap "Quick Share" (via screen-reader, else the learned position) ---
+    qs_node = _wait_node(adb, "Quick Share",
+                         max(2, min(40 if cached.get("qs") else 240, _left())), stop=outer_stop)
+    before = bt.snapshot(save_dir)
+    if auto_accept and qs_accept is not None:
+        threading.Thread(target=lambda: qs_accept.accept_quickshare(timeout=180, log=emit_log),
+                         daemon=True).start()
+    if qs_node is not None:
+        _COORDS.setdefault(key, {})["qs"] = list(core.node_center(qs_node)); _save_coords()
+        adb.tap(*core.node_center(qs_node)); time.sleep(3.0)
+    elif cached.get("qs"):
+        emit_log("phone too busy to read the screen - tapping Quick Share by learned position")
+        adb.tap(*cached["qs"]); time.sleep(3.0); blind = True
+    else:
+        _back_to_list(adb)
+        return ("fail-timeout" if _left() <= 0 else "fail-noshare"), None, None, media["mode"]
+
+    # --- find & tap the PC in the device picker (screen-reader, else learned position) ---
+    cached = _COORDS.get(key, {})
+    pc_node = _wait_node(adb, pc_name, max(2, min(25 if cached.get("pc") else 60, _left())), stop=outer_stop)
+    if pc_node is not None:
+        _COORDS.setdefault(key, {})["pc"] = list(core.node_center(pc_node)); _save_coords()
+        adb.tap(*core.node_center(pc_node)); time.sleep(2.0)
+    elif cached.get("pc"):
+        emit_log(f"tapping {pc_name} by learned position")
+        adb.tap(*cached["pc"]); time.sleep(2.0); blind = True
+    else:
+        _back_to_list(adb)
+        return ("fail-timeout" if _left() <= 0 else "fail-pcpick"), None, None, media["mode"]
+
+    # fail fast on a blind (unreliable) send so a mega-chat can't waste 10 min
+    emit_log(f"sent to {pc_name}; waiting for the file to arrive...")
+    res = bt.wait_for_new_file(save_dir, before, timeout=90 if blind else 600)
+    _back_to_list(adb)
+    if not res:
+        return "fail-transfer", None, None, media["mode"]
+    path, nbytes, digest = res
+    try:
+        case.record_file(Path(path), f"whatsapp export ({media['mode']}) via Quick Share")
+    except Exception:
+        pass
+    emit_log(f"received {Path(path).name} ({nbytes} bytes, {media['mode']})")
+    return "ok", path, digest, media["mode"]
+
+
 # ----------------------------------------------------------------- batch thread
 class WhatsAppBatch(threading.Thread):
     """emit(kind, *args):
@@ -169,7 +335,8 @@ class WhatsAppBatch(threading.Thread):
         ("finished", {"last": <name or None>, "results": [(name, status), ...]})
     """
 
-    def __init__(self, adb, case, size, names, order, emit, pause=None):
+    def __init__(self, adb, case, size, names, order, emit, pause=None,
+                 pc_name=PC_NAME, save_dir=SAVE_DIR):
         super().__init__(daemon=True)
         self.adb, self.case, self.size = adb, case, size
         self.names = names                    # chats to export (subset, in order)
@@ -178,8 +345,27 @@ class WhatsAppBatch(threading.Thread):
         self._stop = threading.Event()
         self._pause = pause or threading.Event()   # set = paused
         self._runner = None                        # current inner export runner
+        self.pc_name, self.save_dir = pc_name, save_dir
+        self.files = {}                            # name -> (filename, sha256, media)
+        self.times = {}                            # name -> ISO time the row became terminal
+        self.csv_path = str(Path(case.dir) / "exported_chats.csv")
         self.last_done = None
         self.results = []
+
+    def _write_csv(self):
+        try:
+            now = core.now_iso()
+            with open(self.csv_path, "w", newline="", encoding="utf-8") as f:
+                wr = csv.writer(f)
+                wr.writerow(["#", "chat", "status", "media", "saved_file", "sha256", "time"])
+                for i, (nm, st) in enumerate(self.results, 1):
+                    self.times.setdefault(nm, now)   # stamp on first write = completion time
+                    fn, digest, media = self.files.get(nm, ("", "", ""))
+                    if not media and st.startswith("fail"):
+                        media = "not exported"       # chat never opened -> no media choice made
+                    wr.writerow([i, _csv_safe(nm), st, media, _csv_safe(fn), digest, self.times[nm]])
+        except Exception as e:
+            self.emit("log", f"csv write failed: {e}")
 
     def stop(self):
         self._stop.set()
@@ -259,6 +445,9 @@ class WhatsAppBatch(threading.Thread):
             if not self._device_ready() and not self._wait_device():
                 self.emit("finished", {"last": None, "results": []}); return
             keep_awake(self.adb, True)
+            if not Path(self.save_dir).is_dir():
+                self.emit("log", f"WARNING: save folder '{self.save_dir}' does not exist - "
+                                 "received files won't be detected. Point Quick Share there.")
             self._ensure_list()
             total = len(self.names)
             for i, name in enumerate(self.names, 1):
@@ -283,18 +472,22 @@ class WhatsAppBatch(threading.Thread):
                         self.emit("progress", i, total, name, "fail-notfound")
                         self.results.append((name, "fail-notfound")); continue
                     self.adb.tap(*core.node_center(node)); time.sleep(1.4)
-                    reason = _run_steps(self.adb, self.case, self.size,
-                                        copy.deepcopy(EXPORT_STEPS) + copy.deepcopy(BACKOUT),
-                                        lambda m: self.emit("log", f"   {m}"),
-                                        outer_stop=self._stop, on_runner=self._set_runner)
+                    status, path, digest, media = export_and_send(
+                        self.adb, self.case, self.size,
+                        emit_log=lambda m: self.emit("log", f"   {m}"),
+                        outer_stop=self._stop, on_runner=self._set_runner,
+                        pc_name=self.pc_name, save_dir=self.save_dir,
+                        deadline=time.time() + MAX_SEND_SECONDS)
+                    # record the media mode that was chosen even if the send later failed
+                    # (blank only if we never reached the with/without-media choice)
+                    self.files[name] = (Path(path).name if path else "", digest or "", media)
                     if self._stop.is_set():
                         self.emit("progress", i, total, name, "stopped"); break
-                    status = "ok" if reason.startswith("done") else "fail-export"
                     self.emit("progress", i, total, name, status)
                     self.results.append((name, status))
                     if status == "ok":
                         self.last_done = name
-                    self._ensure_list()
+                    self._write_csv()
                 except core.AdbError as e:
                     self.emit("log", f"adb error (likely disconnect): {e}")
                     self.emit("progress", i, total, name, "fail-adb")
@@ -305,10 +498,19 @@ class WhatsAppBatch(threading.Thread):
                     except core.AdbError:
                         pass
         finally:
+            self._write_csv()          # guarantee the final state (incl. a last failure) is saved
             self.emit("finished", {"last": self.last_done, "results": self.results})
 
 
 # ----------------------------------------------------------------- CSV helpers
+def _csv_safe(v):
+    """Neutralise spreadsheet formula injection from chat names/filenames."""
+    s = "" if v is None else str(v)
+    if s[:1] in ("=", "+", "-", "@", "\t", "\r"):
+        s = "'" + s
+    return s
+
+
 def save_names_csv(rows, path):
     """rows: list of (name, status). Writes a simple CSV; returns the path."""
     path = str(path)
@@ -316,7 +518,7 @@ def save_names_csv(rows, path):
         wr = csv.writer(f)
         wr.writerow(["#", "chat", "status", "time"])
         for i, (name, status) in enumerate(rows, 1):
-            wr.writerow([i, name, status, core.now_iso()])
+            wr.writerow([i, _csv_safe(name), _csv_safe(status), core.now_iso()])
     return path
 
 
@@ -332,14 +534,18 @@ class RollingBatch(threading.Thread):
         ("finished", {"exported": n, "total": m, "csv": path})
     """
 
-    def __init__(self, adb, case, size, emit, pause=None, csv_path=None):
+    def __init__(self, adb, case, size, emit, pause=None, csv_path=None,
+                 pc_name=PC_NAME, save_dir=SAVE_DIR):
         super().__init__(daemon=True)
         self.adb, self.case, self.size, self.emit = adb, case, size, emit
         self._stop = threading.Event()
         self._pause = pause or threading.Event()
         self._runner = None       # current inner export runner
         self.status = {}          # name -> status
+        self.files = {}           # name -> (filename, sha256, media)
+        self.times = {}           # name -> ISO time the row became terminal
         self.order = []           # discovery order
+        self.pc_name, self.save_dir = pc_name, save_dir
         self.csv_path = str(csv_path) if csv_path else str(Path(case.dir) / "exported_chats.csv")
 
     def stop(self):
@@ -390,7 +596,19 @@ class RollingBatch(threading.Thread):
 
     def _write_csv(self):
         try:
-            save_names_csv([(nm, self.status.get(nm, "")) for nm in self.order], self.csv_path)
+            now = core.now_iso()
+            with open(self.csv_path, "w", newline="", encoding="utf-8") as f:
+                wr = csv.writer(f)
+                wr.writerow(["#", "chat", "status", "media", "saved_file", "sha256", "time"])
+                for i, nm in enumerate(self.order, 1):
+                    st = self.status.get(nm, "")
+                    if st and st not in ("pending", "running"):   # terminal -> stamp once
+                        self.times.setdefault(nm, now)
+                    fn, digest, media = self.files.get(nm, ("", "", ""))
+                    if not media and st.startswith("fail"):
+                        media = "not exported"       # chat never opened -> no media choice made
+                    wr.writerow([i, _csv_safe(nm), st, media,
+                                 _csv_safe(fn), digest, self.times.get(nm, "")])
         except Exception as e:
             self.emit("log", f"csv write failed: {e}")
 
@@ -399,14 +617,16 @@ class RollingBatch(threading.Thread):
         if not node:
             return "fail-notfound"
         self.adb.tap(*core.node_center(node)); time.sleep(1.4)
-        reason = _run_steps(self.adb, self.case, self.size,
-                            copy.deepcopy(EXPORT_STEPS) + copy.deepcopy(BACKOUT),
-                            lambda m: self.emit("log", f"   {m}"),
-                            outer_stop=self._stop, on_runner=self._set_runner)
-        if self._stop.is_set():
-            return "stopped"
-        self._ensure_list()
-        return "ok" if reason.startswith("done") else "fail-export"
+        status, path, digest, media = export_and_send(
+            self.adb, self.case, self.size,
+            emit_log=lambda m: self.emit("log", f"   {m}"),
+            outer_stop=self._stop, on_runner=self._set_runner,
+            pc_name=self.pc_name, save_dir=self.save_dir,
+            deadline=time.time() + MAX_SEND_SECONDS)
+        # record the media mode that was chosen even if the send later failed
+        # (blank only if we never reached the with/without-media choice)
+        self.files[name] = (Path(path).name if path else "", digest or "", media)
+        return status
 
     def run(self):
         exported = 0
@@ -414,9 +634,13 @@ class RollingBatch(threading.Thread):
             if not self._device_ready() and not self._wait_device():
                 self.emit("finished", {"exported": 0, "total": 0, "csv": self.csv_path}); return
             keep_awake(self.adb, True)
+            if not Path(self.save_dir).is_dir():
+                self.emit("log", f"WARNING: save folder '{self.save_dir}' does not exist - "
+                                 "received files won't be detected. Point Quick Share there.")
             self._ensure_list()
             self.emit("log", f"rolling export started - CSV: {self.csv_path}")
             stale = 0
+            empty_reads = 0
             while not self._stop.is_set():
                 self._wait_pause()
                 if self._stop.is_set():
@@ -448,6 +672,13 @@ class RollingBatch(threading.Thread):
                     # whole page done -> scroll for more
                     self._swipe_down()
                     after = [nm for _, nm in visible_chats(self.adb)]
+                    if not after:                      # empty read = screen-reader error, NOT the bottom
+                        empty_reads += 1
+                        if empty_reads >= 8:
+                            self.emit("log", "chat list unreadable repeatedly - stopping")
+                            break
+                        continue
+                    empty_reads = 0
                     if not any(nm not in self.status for nm in after):
                         stale += 1
                         if stale >= 2:                 # nothing new twice = bottom

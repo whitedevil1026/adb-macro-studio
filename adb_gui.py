@@ -347,6 +347,15 @@ class BatchExportWindow(tk.Toplevel):
         self.status_lbl = ttk.Label(top, text="not scanned yet")
         self.status_lbl.pack(side="left", padx=8)
 
+        cfg = ttk.Frame(self, padding=(6, 0))
+        cfg.pack(fill="x")
+        ttk.Label(cfg, text="PC (Quick Share) name:").pack(side="left")
+        self.pc_var = tk.StringVar(value=wb.PC_NAME)
+        ttk.Entry(cfg, textvariable=self.pc_var, width=16).pack(side="left", padx=4)
+        ttk.Label(cfg, text="Save folder:").pack(side="left", padx=(10, 0))
+        self.dir_var = tk.StringVar(value=wb.SAVE_DIR)
+        ttk.Entry(cfg, textvariable=self.dir_var, width=26).pack(side="left", padx=4)
+
         mid = ttk.Frame(self, padding=6)
         mid.pack(fill="both", expand=True)
         self.tree = ttk.Treeview(mid, columns=("chat", "status"), show="headings",
@@ -468,7 +477,9 @@ class BatchExportWindow(tk.Toplevel):
             self.app._live_pause.set()
         self.start_btn.config(state="disabled")
         self.batch = wb.RollingBatch(self.app.adb, self.app.case, self.app.cur_size,
-                                     self._emit, pause=self.pause_evt)
+                                     self._emit, pause=self.pause_evt,
+                                     pc_name=self.pc_var.get().strip() or wb.PC_NAME,
+                                     save_dir=self.dir_var.get().strip() or wb.SAVE_DIR)
         self._log("AUTO scan + export starting (page by page)")
         self._log(f"CSV file: {self.batch.csv_path}")
         self.batch.start()
@@ -519,7 +530,9 @@ class BatchExportWindow(tk.Toplevel):
         self.start_btn.config(state="disabled")
         self._log(f"starting batch over {len(names)} chat(s)")
         self.batch = wb.WhatsAppBatch(self.app.adb, self.app.case, self.app.cur_size,
-                                      names, self.order, self._emit, pause=self.pause_evt)
+                                      names, self.order, self._emit, pause=self.pause_evt,
+                                      pc_name=self.pc_var.get().strip() or wb.PC_NAME,
+                                      save_dir=self.dir_var.get().strip() or wb.SAVE_DIR)
         self.batch.start()
 
     def stop(self):
@@ -583,6 +596,11 @@ class BatchExportWindow(tk.Toplevel):
                         self.app._live_pause.clear()
         except _queue.Empty:
             pass
+        except Exception as _e:                 # one bad event must not freeze the UI
+            try:
+                self._log(f"pump error (skipped): {_e}")
+            except Exception:
+                pass
         self.after(100, self._pump)
 
     def _close(self):
@@ -1181,6 +1199,11 @@ class App:
                     self.runner = None
         except queue.Empty:
             pass
+        except Exception as _e:                 # one bad event must not freeze the UI
+            try:
+                self._log(f"pump error (skipped): {_e}")
+            except Exception:
+                pass
         self.root.after(80, self._pump)
 
     def _on_close(self):
