@@ -27,6 +27,11 @@ except Exception:
 PC_NAME = "YOUR-PC-NAME"                    # the PC's Quick Share device name (shown on the phone)
 SAVE_DIR = str(Path.home() / "Downloads")  # folder where the PC's Quick Share saves received files
 
+# If getting a chat to the "sent" point (export + reach share sheet + pick PC) takes longer
+# than this, give up on it, mark it fail-timeout in the CSV, and move to the next chat.
+# This is what stops a mega-chat (e.g. one that starves the screen-reader) from hanging the run.
+MAX_SEND_SECONDS = 180                      # the actual file transfer keeps its own longer timeout
+
 # Learned tap positions for "Quick Share" and the PC, per screen size. On a mega-chat the
 # phone is too busy for uiautomator to read the share sheet, so we fall back to these.
 _COORD_FILE = Path(__file__).resolve().parent / ".qs_coords.json"
@@ -242,11 +247,16 @@ def _back_to_list(adb, tries=6):
 
 
 def export_and_send(adb, case, size, emit_log=lambda m: None, outer_stop=None,
-                    on_runner=None, pc_name=PC_NAME, save_dir=SAVE_DIR, auto_accept=True):
+                    on_runner=None, pc_name=PC_NAME, save_dir=SAVE_DIR, auto_accept=True,
+                    deadline=None):
     """Open chat is assumed already. Export (media -> fallback), send via Quick Share to
     `pc_name`, wait for the file on the PC, hash it, then navigate back to the chat list.
-    Returns (status, file_path_or_None, sha256_or_None, media_mode).
-    media_mode is "with media" (Include media worked) or "without media" (fell back)."""
+    `deadline` (epoch seconds) caps the time to reach the 'sent' point; if it's blown we give
+    up with 'fail-timeout' and move on (so a mega-chat can't hang the batch). The transfer
+    itself keeps its own longer timeout.
+    Returns (status, file_path_or_None, sha256_or_None, media_mode)."""
+    def _left():
+        return (deadline - time.time()) if deadline else 1e9
     media = {"mode": ""}
     def _log(m):
         if "branch -> THEN" in m:
@@ -255,9 +265,13 @@ def export_and_send(adb, case, size, emit_log=lambda m: None, outer_stop=None,
             media["mode"] = "with media"        # Include media succeeded
         emit_log(m)
     reason = _run_steps(adb, case, size, copy.deepcopy(EXPORT_STEPS), _log,
-                        outer_stop=outer_stop, on_runner=on_runner)
+                        outer_stop=outer_stop, on_runner=on_runner,
+                        limit=max(5, min(420, _left())))
     if outer_stop is not None and outer_stop.is_set():
         return "stopped", None, None, media["mode"]
+    if _left() <= 0:
+        emit_log("took too long to export - skipping (fail-timeout)")
+        _back_to_list(adb); return "fail-timeout", None, None, media["mode"]
     if not reason.startswith("done"):
         _back_to_list(adb)
         return "fail-export", None, None, media["mode"]
@@ -267,7 +281,7 @@ def export_and_send(adb, case, size, emit_log=lambda m: None, outer_stop=None,
 
     # --- find & tap "Quick Share" (via screen-reader, else the learned position) ---
     qs_node = _wait_node(adb, "Quick Share",
-                         40 if cached.get("qs") else 240, stop=outer_stop)
+                         max(2, min(40 if cached.get("qs") else 240, _left())), stop=outer_stop)
     before = bt.snapshot(save_dir)
     if auto_accept and qs_accept is not None:
         threading.Thread(target=lambda: qs_accept.accept_quickshare(timeout=180, log=emit_log),
@@ -279,11 +293,12 @@ def export_and_send(adb, case, size, emit_log=lambda m: None, outer_stop=None,
         emit_log("phone too busy to read the screen - tapping Quick Share by learned position")
         adb.tap(*cached["qs"]); time.sleep(3.0); blind = True
     else:
-        _back_to_list(adb); return "fail-noshare", None, None, media["mode"]
+        _back_to_list(adb)
+        return ("fail-timeout" if _left() <= 0 else "fail-noshare"), None, None, media["mode"]
 
     # --- find & tap the PC in the device picker (screen-reader, else learned position) ---
     cached = _COORDS.get(key, {})
-    pc_node = _wait_node(adb, pc_name, 25 if cached.get("pc") else 60, stop=outer_stop)
+    pc_node = _wait_node(adb, pc_name, max(2, min(25 if cached.get("pc") else 60, _left())), stop=outer_stop)
     if pc_node is not None:
         _COORDS.setdefault(key, {})["pc"] = list(core.node_center(pc_node)); _save_coords()
         adb.tap(*core.node_center(pc_node)); time.sleep(2.0)
@@ -291,7 +306,8 @@ def export_and_send(adb, case, size, emit_log=lambda m: None, outer_stop=None,
         emit_log(f"tapping {pc_name} by learned position")
         adb.tap(*cached["pc"]); time.sleep(2.0); blind = True
     else:
-        _back_to_list(adb); return "fail-pcpick", None, None, media["mode"]
+        _back_to_list(adb)
+        return ("fail-timeout" if _left() <= 0 else "fail-pcpick"), None, None, media["mode"]
 
     # fail fast on a blind (unreliable) send so a mega-chat can't waste 10 min
     emit_log(f"sent to {pc_name}; waiting for the file to arrive...")
@@ -452,7 +468,8 @@ class WhatsAppBatch(threading.Thread):
                         self.adb, self.case, self.size,
                         emit_log=lambda m: self.emit("log", f"   {m}"),
                         outer_stop=self._stop, on_runner=self._set_runner,
-                        pc_name=self.pc_name, save_dir=self.save_dir)
+                        pc_name=self.pc_name, save_dir=self.save_dir,
+                        deadline=time.time() + MAX_SEND_SECONDS)
                     self.files[name] = (Path(path).name if path else "", digest or "",
                                         media if status == "ok" else "")
                     if self._stop.is_set():
@@ -587,7 +604,8 @@ class RollingBatch(threading.Thread):
             self.adb, self.case, self.size,
             emit_log=lambda m: self.emit("log", f"   {m}"),
             outer_stop=self._stop, on_runner=self._set_runner,
-            pc_name=self.pc_name, save_dir=self.save_dir)
+            pc_name=self.pc_name, save_dir=self.save_dir,
+            deadline=time.time() + MAX_SEND_SECONDS)
         self.files[name] = (Path(path).name if path else "", digest or "",
                             media if status == "ok" else "")
         return status
