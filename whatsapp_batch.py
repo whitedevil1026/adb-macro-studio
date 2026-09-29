@@ -257,10 +257,13 @@ def export_and_send(adb, case, size, emit_log=lambda m: None, outer_stop=None,
     Returns (status, file_path_or_None, sha256_or_None, media_mode)."""
     def _left():
         return (deadline - time.time()) if deadline else 1e9
-    media = {"mode": ""}
+    # the flow always ATTEMPTS with-media first (it taps "Include media"), so default to that.
+    # the branch only downgrades to "without media" if WhatsApp rejects the media export.
+    # => the media column is filled for every chat that reaches the export screen, pass or fail.
+    media = {"mode": "with media"}
     def _log(m):
         if "branch -> THEN" in m:
-            media["mode"] = "without media"     # media failed -> fell back
+            media["mode"] = "without media"     # media too big -> fell back
         elif "branch -> ELSE" in m:
             media["mode"] = "with media"        # Include media succeeded
         emit_log(m)
