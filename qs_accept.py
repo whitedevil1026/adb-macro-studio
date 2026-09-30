@@ -20,6 +20,10 @@ def accept_quickshare(timeout=45, poll=0.4, log=lambda m: None, labels=ACCEPT_LA
         log(f"pywinauto missing: {e}")
         return False
 
+    def _matches(text):
+        t = (text or "").strip().lower()
+        return bool(t) and any(lbl in t for lbl in labels)   # substring: "Accept", "Accept & save", ...
+
     end = time.time() + timeout
     while time.time() < end:
         try:
@@ -30,21 +34,25 @@ def accept_quickshare(timeout=45, poll=0.4, log=lambda m: None, labels=ACCEPT_LA
                         continue
                 except Exception:
                     continue
-                try:
-                    btns = w.descendants(control_type="Button")
-                except Exception:
-                    btns = []
-                for b in btns:
+                # try Buttons first, then any control with a matching name (some builds use a
+                # hyperlink / custom control for Accept).
+                cands = []
+                for ct in ("Button", None):
                     try:
-                        if (b.window_text() or "").strip().lower() in labels:
-                            try:
-                                b.invoke()
-                            except Exception:
-                                b.click_input()
-                            log("clicked Accept")
-                            return True
+                        cands = w.descendants(control_type=ct) if ct else w.descendants()
                     except Exception:
-                        pass
+                        cands = []
+                    for b in cands:
+                        try:
+                            if _matches(b.window_text()):
+                                try:
+                                    b.invoke()
+                                except Exception:
+                                    b.click_input()
+                                log("clicked Accept")
+                                return True
+                        except Exception:
+                            pass
         except Exception:
             pass
         time.sleep(poll)

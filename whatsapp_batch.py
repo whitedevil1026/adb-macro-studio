@@ -11,6 +11,7 @@ from __future__ import annotations
 import copy
 import csv
 import json
+import re
 import threading
 import time
 from pathlib import Path
@@ -32,11 +33,13 @@ SAVE_DIR = str(Path.home() / "Downloads")  # folder where the PC's Quick Share s
 # This is what stops a mega-chat (e.g. one that starves the screen-reader) from hanging the run.
 MAX_SEND_SECONDS = 180                      # the actual file transfer keeps its own longer timeout
 
-# Quick Share transfers fail intermittently at the OS/Bluetooth/Wi-Fi-Direct layer (more often
-# on large files) - that's not a bug in this tool, so we just retry the whole export+send a few
-# times before giving up. Only transient SHARE failures are retried (not fail-export / timeout).
+# Quick Share transfers (and, occasionally, the export menu) fail transiently - the transfer at
+# the OS/Bluetooth/Wi-Fi-Direct layer (more often on large files), the menu when the phone is
+# briefly too busy to render "Include media" in time. Neither is a logic bug, so we just retry
+# the whole export+send a few times before giving up. A mega-chat 'fail-timeout' is NOT retried
+# (retrying it would just time out again), and 'fail-notfound' is handled separately.
 SHARE_RETRIES = 2                           # extra attempts after the first (so up to 3 total)
-SHARE_RETRY_STATUSES = ("fail-transfer", "fail-noshare", "fail-pcpick")
+SHARE_RETRY_STATUSES = ("fail-transfer", "fail-noshare", "fail-pcpick", "fail-export")
 
 # Learned tap positions for "Quick Share" and the PC, per screen size. On a mega-chat the
 # phone is too busy for uiautomator to read the share sheet, so we fall back to these.
@@ -58,19 +61,21 @@ LIST_MARKER = "Ask Meta AI or Search"             # present on the chat list
 CHAT_MARKER = "More options"                       # present inside a chat
 
 # The proven single-chat export flow (with-media, fallback to without-media).
+# Timeouts are generous: on a busy phone the export menu / "Include media" dialog can take
+# several seconds to render, and a too-short wait was causing false "fail-export" results.
 EXPORT_STEPS = [
-    {"type": "tap_text", "text": "More options", "match": "contains", "timeout": 10, "delay": 0.6},
-    {"type": "tap_text", "text": "More", "match": "exact", "timeout": 8, "delay": 0.6},
-    {"type": "tap_text", "text": "Export chat", "match": "contains", "timeout": 8, "delay": 0.7},
-    {"type": "tap_text", "text": "Include media", "match": "contains", "timeout": 8, "delay": 0.5},
+    {"type": "tap_text", "text": "More options", "match": "contains", "timeout": 15, "delay": 0.8},
+    {"type": "tap_text", "text": "More", "match": "exact", "timeout": 12, "delay": 0.8},
+    {"type": "tap_text", "text": "Export chat", "match": "contains", "timeout": 15, "delay": 1.0},
+    {"type": "tap_text", "text": "Include media", "match": "contains", "timeout": 18, "delay": 0.7},
     {"type": "if_text", "text": "Unable to export", "match": "contains", "timeout": 300,
      "or_text": "Quick Share", "delay": 0.3,
      "then": [
-         {"type": "tap_text", "text": "OK", "match": "exact", "timeout": 8, "delay": 0.6},
-         {"type": "tap_text", "text": "More options", "match": "contains", "timeout": 8, "delay": 0.6},
-         {"type": "tap_text", "text": "More", "match": "exact", "timeout": 8, "delay": 0.6},
-         {"type": "tap_text", "text": "Export chat", "match": "contains", "timeout": 8, "delay": 0.7},
-         {"type": "tap_text", "text": "Without media", "match": "contains", "timeout": 8, "delay": 0.5},
+         {"type": "tap_text", "text": "OK", "match": "exact", "timeout": 10, "delay": 0.8},
+         {"type": "tap_text", "text": "More options", "match": "contains", "timeout": 15, "delay": 0.8},
+         {"type": "tap_text", "text": "More", "match": "exact", "timeout": 12, "delay": 0.8},
+         {"type": "tap_text", "text": "Export chat", "match": "contains", "timeout": 15, "delay": 1.0},
+         {"type": "tap_text", "text": "Without media", "match": "contains", "timeout": 18, "delay": 0.7},
      ],
      "else": []},
 ]
@@ -301,8 +306,18 @@ def export_and_send(adb, case, size, emit_log=lambda m: None, outer_stop=None,
         emit_log("took too long to export - skipping (fail-timeout)")
         _back_to_list(adb); return "fail-timeout", None, None, media["mode"]
     if not reason.startswith("done"):
-        _back_to_list(adb)
-        return "fail-export", None, None, media["mode"]
+        # Salvage a good export whose menu steps didn't report cleanly: if we got PAST "Export
+        # chat" (failure at step 4 = the Include-media dialog, or later) AND the Quick Share
+        # sheet is now up, the export really succeeded - carry on. A failure at an earlier menu
+        # step means the export never started, so a visible share sheet would be stale/leftover
+        # (not ours) - treat that as fail-export.
+        m = re.search(r"(\d+)\s*$", reason or "")
+        step_no = int(m.group(1)) if m else 0
+        if step_no >= 4 and _wait_text(adb, "Quick Share", timeout=4, stop=outer_stop) is not None:
+            emit_log("export incomplete at the media dialog, but Quick Share is up - continuing")
+        else:
+            _back_to_list(adb)
+            return "fail-export", None, None, media["mode"]
     key = f"{size[0]}x{size[1]}"
     cached = _COORDS.get(key, {})
     blind = False                              # did we fall back to a learned position?
@@ -368,7 +383,7 @@ def export_with_retry(adb, case, size, reopen, emit_log, outer_stop, on_runner,
                 or (outer_stop is not None and outer_stop.is_set())
                 or attempt >= SHARE_RETRIES):
             return status, path, digest, media
-        emit_log(f"Quick Share {status} - retrying (attempt {attempt + 2}/{1 + SHARE_RETRIES})")
+        emit_log(f"{status} - retrying (attempt {attempt + 2}/{1 + SHARE_RETRIES})")
         ensure_list()
     return status, path, digest, media
 
