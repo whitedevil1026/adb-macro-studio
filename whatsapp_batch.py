@@ -815,14 +815,17 @@ class RollingBatch(threading.Thread):
         # skipped. (A faster/longer swipe flings past rows and was missing chats.)
         w, h = self.size                       # screen size, read from the device on connect
         cx, cy = w // 2, h // 2                # exact centre point
-        off = int(h * 0.07)                    # very small symmetric swing (~14% of the screen)
-        self.adb.swipe(cx, cy + off, cx, cy - off, 1000); time.sleep(0.9)
+        # Tiny swing over a VERY slow stroke so the release velocity is far below Android's fling
+        # threshold -> the list moves exactly the drag distance with NO momentum/overshoot, so no
+        # chat is flung past unread. (0.06h over 2200ms ~= 85 px/s on a 3120px screen.)
+        off = int(h * 0.06)
+        self.adb.swipe(cx, cy + off, cx, cy - off, 2200); time.sleep(1.0)
 
     def _swipe_up(self):
         w, h = self.size
         cx, cy = w // 2, h // 2
-        off = int(h * 0.07)
-        self.adb.swipe(cx, cy - off, cx, cy + off, 1000); time.sleep(0.9)
+        off = int(h * 0.06)
+        self.adb.swipe(cx, cy - off, cx, cy + off, 2200); time.sleep(1.0)
 
     def _seek_chat(self, target, max_scrolls=120):
         """Scroll from the top until `target` is on screen; mark every chat passed on the way as
