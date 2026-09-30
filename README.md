@@ -235,6 +235,10 @@ and survives lists of hundreds of chats. Per chat it:
 *Resume pending* (retry rows still pending or failed), *Save CSV*, and *Stop* (halts within a few
 seconds — it also interrupts an in-progress export).
 
+**Export only selected chats:** *Scan* to list the chats, **select the ones you want** in the
+list, then click *Auto* — it exports only the selected chats and marks the rest `skipped`. (With
+nothing selected, *Auto* exports everything.) The separate *Export selected* button also works.
+
 ### Resume after an interruption (lock / crash / disconnect)
 So you never have to redo work if the phone locks or the run stops midway:
 - **Resume from CSV…** — pick a previous run's `exported_chats.csv`. Chats already `ok` are

@@ -433,10 +433,11 @@ def export_and_send(adb, case, size, emit_log=lambda m: None, outer_stop=None,
     if pc_node is not None:
         _COORDS.setdefault(key, {})["pc"] = list(core.node_center(pc_node)); _save_coords()
         adb.tap(*core.node_center(pc_node)); time.sleep(2.0)
-    elif cached.get("pc"):
-        emit_log(f"tapping {pc_name} by learned position")
-        adb.tap(*cached["pc"]); time.sleep(2.0); blind = True
     else:
+        # SAFETY: never blind-tap a learned position for the PC. The Quick Share device-picker
+        # order is NOT fixed (other nearby devices come and go), so a blind tap could send the
+        # export to the WRONG device. Fail instead; the retry will try again once the picker is
+        # readable and the correct PC can be matched by name.
         _back_to_list(adb)
         return ("fail-timeout" if _left() <= 0 else "fail-pcpick"), None, None, media["mode"]
 
@@ -759,6 +760,7 @@ class RollingBatch(threading.Thread):
         self.csv_path = str(csv_path) if csv_path else str(Path(case.dir) / "exported_chats.csv")
         self.resume_from = resume_from   # path to a prior CSV: skip its 'ok' chats, retry the rest
         self.start_from = start_from     # chat name to scroll to and begin at (skip everything above)
+        self.only_names = None           # if set (a set of names), export ONLY these; skip others
 
     def stop(self):
         self._stop.set()
@@ -813,14 +815,14 @@ class RollingBatch(threading.Thread):
         # skipped. (A faster/longer swipe flings past rows and was missing chats.)
         w, h = self.size                       # screen size, read from the device on connect
         cx, cy = w // 2, h // 2                # exact centre point
-        off = int(h * 0.09)                    # small symmetric swing (~18% of the screen)
-        self.adb.swipe(cx, cy + off, cx, cy - off, 900); time.sleep(0.8)
+        off = int(h * 0.07)                    # very small symmetric swing (~14% of the screen)
+        self.adb.swipe(cx, cy + off, cx, cy - off, 1000); time.sleep(0.9)
 
     def _swipe_up(self):
         w, h = self.size
         cx, cy = w // 2, h // 2
-        off = int(h * 0.09)
-        self.adb.swipe(cx, cy - off, cx, cy + off, 900); time.sleep(0.8)
+        off = int(h * 0.07)
+        self.adb.swipe(cx, cy - off, cx, cy + off, 1000); time.sleep(0.9)
 
     def _seek_chat(self, target, max_scrolls=120):
         """Scroll from the top until `target` is on screen; mark every chat passed on the way as
@@ -946,8 +948,13 @@ class RollingBatch(threading.Thread):
                         visible = [nm for _, nm in visible_chats(self.adb)]
                     for nm in visible:
                         if nm not in self.status:
-                            self.status[nm] = "pending"; self.order.append(nm)
+                            # export only the selected chats when a whitelist is set; skip the rest
+                            sel = self.only_names is None or nm in self.only_names
+                            self.status[nm] = "pending" if sel else "skipped"
+                            self.order.append(nm)
                             self.emit("discover", nm)
+                            if not sel:
+                                self.emit("row", nm, "skipped")
                     self._write_csv()
                     todo = [nm for nm in visible if self.status.get(nm) == "pending"]
                     if todo:

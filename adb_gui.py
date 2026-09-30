@@ -505,13 +505,20 @@ class BatchExportWindow(tk.Toplevel):
         if getattr(self.app, "_live_pause", None):
             self.app._live_pause.set()
         self.start_btn.config(state="disabled")
+        # if chats are selected in the list (after a Scan), export ONLY those; else export all
+        sel = self.tree.selection()
+        only = {self.tree.item(iid, "values")[0] for iid in sel} if sel else None
         self.batch = wb.RollingBatch(self.app.adb, self.app.case, self.app.cur_size,
                                      self._emit, pause=self.pause_evt,
                                      pc_name=self.pc_var.get().strip() or wb.PC_NAME,
                                      save_dir=self.dir_var.get().strip() or wb.SAVE_DIR,
                                      resume_from=self.resume_path,
                                      start_from=self.startfrom_var.get().strip() or None)
-        self._log("AUTO scan + export starting (page by page)")
+        if only:
+            self.batch.only_names = only
+            self._log(f"AUTO: exporting ONLY the {len(only)} selected chat(s)")
+        else:
+            self._log("AUTO scan + export starting (page by page)")
         self._log(f"CSV file: {self.batch.csv_path}")
         self.batch.start()
 
