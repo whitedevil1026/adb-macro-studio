@@ -594,12 +594,12 @@ class RollingBatch(threading.Thread):
         w, h = self.size
         # Scroll strictly inside the MIDDLE band of the screen, centred on h/2, so the gesture
         # never reaches the bottom "home" area (which minimises/closes WhatsApp) or the top bar.
-        # Symmetric around the middle (0.60h -> 0.40h = ~20% of the screen), horizontally centred,
+        # Symmetric around the middle (0.66h -> 0.34h = ~32% of the screen), horizontally centred,
         # with a slow ~600ms stroke so it drags (no fling momentum that would skip chats). Small
         # enough to keep big overlap, large enough to always advance. Uses the live w/h read from
         # the device on connect, so it adapts to any resolution.
         cx = w // 2
-        self.adb.swipe(cx, int(h * 0.60), cx, int(h * 0.40), 600); time.sleep(0.6)
+        self.adb.swipe(cx, int(h * 0.66), cx, int(h * 0.34), 600); time.sleep(0.6)
 
     def _write_csv(self):
         try:
