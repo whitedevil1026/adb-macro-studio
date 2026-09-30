@@ -775,14 +775,15 @@ class RollingBatch(threading.Thread):
         return bool(on_chat_list(self.adb))
 
     def _swipe_down(self):
-        # Work from the EXACT centre of the screen (computed from the live device size), and
-        # drag symmetrically about it: from (cx, cy+off) down-to-up to (cx, cy-off). Centring on
-        # the true midpoint keeps the whole gesture in the middle band, far from the bottom
-        # "home" gesture area (which minimises/closes WhatsApp) and the top status bar.
+        # Drag symmetrically about the EXACT centre (cx, cy+off -> cy-off), staying in the middle
+        # band so it never hits the bottom "home" gesture area (which would close WhatsApp).
+        # A SHORT swing over a SLOW stroke = a controlled drag with no fling momentum, so the list
+        # advances only a little each time and keeps a big overlap between pages -> no chat is
+        # skipped. (A faster/longer swipe flings past rows and was missing chats.)
         w, h = self.size                       # screen size, read from the device on connect
         cx, cy = w // 2, h // 2                # exact centre point
-        off = int(h * 0.12)                    # symmetric offset above/below centre (~24% span)
-        self.adb.swipe(cx, cy + off, cx, cy - off, 600); time.sleep(0.6)
+        off = int(h * 0.09)                    # small symmetric swing (~18% of the screen)
+        self.adb.swipe(cx, cy + off, cx, cy - off, 900); time.sleep(0.8)
 
     def _write_csv(self):
         try:
