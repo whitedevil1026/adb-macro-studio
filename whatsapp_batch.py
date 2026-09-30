@@ -32,6 +32,12 @@ SAVE_DIR = str(Path.home() / "Downloads")  # folder where the PC's Quick Share s
 # This is what stops a mega-chat (e.g. one that starves the screen-reader) from hanging the run.
 MAX_SEND_SECONDS = 180                      # the actual file transfer keeps its own longer timeout
 
+# Quick Share transfers fail intermittently at the OS/Bluetooth/Wi-Fi-Direct layer (more often
+# on large files) - that's not a bug in this tool, so we just retry the whole export+send a few
+# times before giving up. Only transient SHARE failures are retried (not fail-export / timeout).
+SHARE_RETRIES = 2                           # extra attempts after the first (so up to 3 total)
+SHARE_RETRY_STATUSES = ("fail-transfer", "fail-noshare", "fail-pcpick")
+
 # Learned tap positions for "Quick Share" and the PC, per screen size. On a mega-chat the
 # phone is too busy for uiautomator to read the share sheet, so we fall back to these.
 _COORD_FILE = Path(__file__).resolve().parent / ".qs_coords.json"
@@ -346,6 +352,27 @@ def export_and_send(adb, case, size, emit_log=lambda m: None, outer_stop=None,
     return "ok", path, digest, media["mode"]
 
 
+def export_with_retry(adb, case, size, reopen, emit_log, outer_stop, on_runner,
+                      pc_name, save_dir, ensure_list):
+    """Run export_and_send, retrying the whole thing on a transient Quick Share failure
+    (fail-transfer/noshare/pcpick). `reopen()` re-opens the chat from the list and returns
+    True, or False if the chat row can't be found. Returns (status, path, digest, media)."""
+    status, path, digest, media = "fail-notfound", None, None, ""
+    for attempt in range(1 + SHARE_RETRIES):
+        if not reopen():
+            return "fail-notfound", None, None, ""
+        status, path, digest, media = export_and_send(
+            adb, case, size, emit_log=emit_log, outer_stop=outer_stop, on_runner=on_runner,
+            pc_name=pc_name, save_dir=save_dir, deadline=time.time() + MAX_SEND_SECONDS)
+        if (status not in SHARE_RETRY_STATUSES
+                or (outer_stop is not None and outer_stop.is_set())
+                or attempt >= SHARE_RETRIES):
+            return status, path, digest, media
+        emit_log(f"Quick Share {status} - retrying (attempt {attempt + 2}/{1 + SHARE_RETRIES})")
+        ensure_list()
+    return status, path, digest, media
+
+
 # ----------------------------------------------------------------- batch thread
 class WhatsAppBatch(threading.Thread):
     """emit(kind, *args):
@@ -489,17 +516,19 @@ class WhatsAppBatch(threading.Thread):
                     if not self._ensure_list():
                         self.emit("progress", i, total, name, "fail-nolist")
                         self.results.append((name, "fail-nolist")); continue
-                    node = self._scroll_to(name)
-                    if not node:
+                    def reopen():
+                        node = self._scroll_to(name)
+                        if not node:
+                            return False
+                        self.adb.tap(*core.node_center(node)); time.sleep(1.4)
+                        return True
+                    status, path, digest, media = export_with_retry(
+                        self.adb, self.case, self.size, reopen,
+                        lambda m: self.emit("log", f"   {m}"),
+                        self._stop, self._set_runner, self.pc_name, self.save_dir, self._ensure_list)
+                    if status == "fail-notfound":
                         self.emit("progress", i, total, name, "fail-notfound")
                         self.results.append((name, "fail-notfound")); continue
-                    self.adb.tap(*core.node_center(node)); time.sleep(1.4)
-                    status, path, digest, media = export_and_send(
-                        self.adb, self.case, self.size,
-                        emit_log=lambda m: self.emit("log", f"   {m}"),
-                        outer_stop=self._stop, on_runner=self._set_runner,
-                        pc_name=self.pc_name, save_dir=self.save_dir,
-                        deadline=time.time() + MAX_SEND_SECONDS)
                     # record the media mode that was chosen even if the send later failed
                     # (blank only if we never reached the with/without-media choice)
                     self.files[name] = (Path(path).name if path else "", digest or "", media)
@@ -644,16 +673,16 @@ class RollingBatch(threading.Thread):
             self.emit("log", f"csv write failed: {e}")
 
     def _export_one(self, name):
-        node = _find_chat_node(self.adb, name)
-        if not node:
-            return "fail-notfound"
-        self.adb.tap(*core.node_center(node)); time.sleep(1.4)
-        status, path, digest, media = export_and_send(
-            self.adb, self.case, self.size,
-            emit_log=lambda m: self.emit("log", f"   {m}"),
-            outer_stop=self._stop, on_runner=self._set_runner,
-            pc_name=self.pc_name, save_dir=self.save_dir,
-            deadline=time.time() + MAX_SEND_SECONDS)
+        def reopen():
+            node = _find_chat_node(self.adb, name)
+            if not node:
+                return False
+            self.adb.tap(*core.node_center(node)); time.sleep(1.4)
+            return True
+        status, path, digest, media = export_with_retry(
+            self.adb, self.case, self.size, reopen,
+            lambda m: self.emit("log", f"   {m}"),
+            self._stop, self._set_runner, self.pc_name, self.save_dir, self._ensure_list)
         # record the media mode that was chosen even if the send later failed
         # (blank only if we never reached the with/without-media choice)
         self.files[name] = (Path(path).name if path else "", digest or "", media)
