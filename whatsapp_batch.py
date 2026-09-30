@@ -253,6 +253,107 @@ def _wait_node(adb, text, timeout=30, match="contains", stop=None):
     return None
 
 
+def _wait_either(adb, text_a, text_b, timeout=60, match="contains", stop=None):
+    """Return 'a' if text_a appears first, 'b' if text_b appears first, None on timeout/stop."""
+    end = time.time() + timeout
+    while time.time() < end:
+        if stop is not None and stop.is_set():
+            return None
+        nodes = _nodes(adb)
+        if core.find_node(nodes, text_a, match):
+            return "a"
+        if core.find_node(nodes, text_b, match):
+            return "b"
+        time.sleep(0.7)
+    return None
+
+
+def _open_export_menu(adb, stop=None, left=lambda: 1e9):
+    """Reliably navigate the chat overflow menu to reveal "Export chat".
+
+    The single tap on the 3-dots ("More options") is frequently SWALLOWED by WhatsApp, so a
+    blind one-shot tap often leaves the menu closed and "More"/"Export chat" is never found.
+    Here we tap the 3-dots and CONFIRM the menu actually opened (a menu item is visible),
+    re-tapping if it didn't, then tap "More" to reveal "Export chat". Returns True when
+    "Export chat" is on screen."""
+    def _stopped():
+        return stop is not None and stop.is_set()
+    for _ in range(4):                                  # whole-menu attempts
+        if _stopped() or left() <= 0:
+            return False
+        if core.find_node(_nodes(adb), "Export chat", "contains"):
+            return True
+        # 1) open the overflow menu, verifying it actually opened
+        opened = False
+        for _ in range(3):                             # re-tap the 3-dots until the menu shows
+            if _stopped() or left() <= 0:
+                return False
+            dots = _wait_node(adb, "More options", timeout=5, match="contains", stop=stop)
+            if dots is None:
+                break
+            adb.tap(*core.node_center(dots)); time.sleep(1.4)
+            nodes = _nodes(adb)
+            if core.find_node(nodes, "Export chat", "contains"):
+                return True                            # some layouts show Export chat directly
+            if core.find_node(nodes, "More", "exact"):
+                opened = True; break                   # menu is up (has the "More" item)
+        if not opened:
+            continue
+        # 2) tap "More" -> reveals Export chat
+        if _tap_text(adb, "More", timeout=6, match="exact", delay=1.0, stop=stop):
+            if _wait_text(adb, "Export chat", timeout=6, match="contains", stop=stop):
+                return True
+    return False
+
+
+def _do_export(adb, media, emit_log, outer_stop, left):
+    """Export the open chat, WITH media first, falling back to WITHOUT media only if WhatsApp
+    rejects it ("Unable to export"). Sets media['mode']. Returns 'done' / 'fail' / 'stopped' /
+    'timeout'. On 'done' the Quick Share sheet is showing."""
+    def _stopped():
+        return outer_stop is not None and outer_stop.is_set()
+
+    def _open_and_tap_export():
+        if not _open_export_menu(adb, stop=outer_stop, left=left):
+            return False
+        return _tap_text(adb, "Export chat", timeout=12, match="contains", delay=1.2, stop=outer_stop)
+
+    # --- attempt WITH media ---
+    media["mode"] = "with media"
+    if not _open_and_tap_export():
+        return "stopped" if _stopped() else ("timeout" if left() <= 0 else "fail")
+    # tap "Include media"; re-tap if the choice dialog is still showing (that tap gets swallowed too)
+    for _ in range(3):
+        if _stopped():
+            return "stopped"
+        if core.find_node(_nodes(adb), "Include media", "contains") is None:
+            break                                       # dialog gone -> export proceeding
+        _tap_text(adb, "Include media", timeout=8, match="contains", delay=1.0, stop=outer_stop)
+    # branch: "Unable to export" (too big) -> fall back; else the Quick Share sheet appears
+    which = _wait_either(adb, "Unable to export", "Quick Share",
+                         timeout=max(5, min(300, left())), stop=outer_stop)
+    if which == "b":
+        return "done"                                   # with media reached Quick Share
+    if which is None:
+        return "stopped" if _stopped() else ("timeout" if left() <= 0 else "fail")
+
+    # --- media rejected -> fall back to WITHOUT media ---
+    media["mode"] = "without media"
+    emit_log("media too big - falling back to Without media")
+    _tap_text(adb, "OK", timeout=10, match="exact", delay=0.8, stop=outer_stop)
+    if not _open_and_tap_export():
+        return "stopped" if _stopped() else ("timeout" if left() <= 0 else "fail")
+    for _ in range(3):
+        if _stopped():
+            return "stopped"
+        if core.find_node(_nodes(adb), "Without media", "contains") is None:
+            break
+        _tap_text(adb, "Without media", timeout=8, match="contains", delay=1.0, stop=outer_stop)
+    if _wait_text(adb, "Quick Share", timeout=max(5, min(240, left())), stop=outer_stop):
+        return "done"
+    return "stopped" if _stopped() else ("timeout" if left() <= 0 else "fail")
+
+
 def _back_to_list(adb, tries=8):
     for _ in range(tries):
         st = on_chat_list(adb)
@@ -290,34 +391,18 @@ def export_and_send(adb, case, size, emit_log=lambda m: None, outer_stop=None,
     # the flow always ATTEMPTS with-media first (it taps "Include media"), so default to that.
     # the branch only downgrades to "without media" if WhatsApp rejects the media export.
     # => the media column is filled for every chat that reaches the export screen, pass or fail.
+    # the flow ATTEMPTS with-media first; _do_export downgrades media['mode'] to "without media"
+    # only if WhatsApp rejects the media export.
     media = {"mode": "with media"}
-    def _log(m):
-        if "branch -> THEN" in m:
-            media["mode"] = "without media"     # media too big -> fell back
-        elif "branch -> ELSE" in m:
-            media["mode"] = "with media"        # Include media succeeded
-        emit_log(m)
-    reason = _run_steps(adb, case, size, copy.deepcopy(EXPORT_STEPS), _log,
-                        outer_stop=outer_stop, on_runner=on_runner,
-                        limit=max(5, min(420, _left())))
-    if outer_stop is not None and outer_stop.is_set():
+    reason = _do_export(adb, media, emit_log, outer_stop, _left)
+    if reason == "stopped":
         return "stopped", None, None, media["mode"]
-    if _left() <= 0:
+    if reason == "timeout":
         emit_log("took too long to export - skipping (fail-timeout)")
         _back_to_list(adb); return "fail-timeout", None, None, media["mode"]
-    if not reason.startswith("done"):
-        # Salvage a good export whose menu steps didn't report cleanly: if we got PAST "Export
-        # chat" (failure at step 4 = the Include-media dialog, or later) AND the Quick Share
-        # sheet is now up, the export really succeeded - carry on. A failure at an earlier menu
-        # step means the export never started, so a visible share sheet would be stale/leftover
-        # (not ours) - treat that as fail-export.
-        m = re.search(r"(\d+)\s*$", reason or "")
-        step_no = int(m.group(1)) if m else 0
-        if step_no >= 4 and _wait_text(adb, "Quick Share", timeout=4, stop=outer_stop) is not None:
-            emit_log("export incomplete at the media dialog, but Quick Share is up - continuing")
-        else:
-            _back_to_list(adb)
-            return "fail-export", None, None, media["mode"]
+    if reason != "done":
+        _back_to_list(adb)
+        return "fail-export", None, None, media["mode"]
     key = f"{size[0]}x{size[1]}"
     cached = _COORDS.get(key, {})
     blind = False                              # did we fall back to a learned position?
