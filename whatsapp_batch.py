@@ -322,13 +322,15 @@ def _do_export(adb, media, emit_log, outer_stop, left):
     media["mode"] = "with media"
     if not _open_and_tap_export():
         return "stopped" if _stopped() else ("timeout" if left() <= 0 else "fail")
-    # tap "Include media"; re-tap if the choice dialog is still showing (that tap gets swallowed too)
-    for _ in range(3):
-        if _stopped():
-            return "stopped"
-        if core.find_node(_nodes(adb), "Include media", "contains") is None:
-            break                                       # dialog gone -> export proceeding
-        _tap_text(adb, "Include media", timeout=8, match="contains", delay=1.0, stop=outer_stop)
+    # WAIT for the media-choice dialog to appear after "Export chat", THEN tap "Include media".
+    # (Don't assume it's instant - tapping too early / bailing early was leaving the export stuck.)
+    if _wait_text(adb, "Include media", timeout=15, match="contains", stop=outer_stop):
+        for _ in range(3):                              # re-tap if the choice dialog lingers
+            if _stopped():
+                return "stopped"
+            if core.find_node(_nodes(adb), "Include media", "contains") is None:
+                break                                   # tapped -> dialog gone, export proceeding
+            _tap_text(adb, "Include media", timeout=8, match="contains", delay=1.2, stop=outer_stop)
     # branch: "Unable to export" (too big) -> fall back; else the Quick Share sheet appears
     which = _wait_either(adb, "Unable to export", "Quick Share",
                          timeout=max(5, min(300, left())), stop=outer_stop)
@@ -343,12 +345,13 @@ def _do_export(adb, media, emit_log, outer_stop, left):
     _tap_text(adb, "OK", timeout=10, match="exact", delay=0.8, stop=outer_stop)
     if not _open_and_tap_export():
         return "stopped" if _stopped() else ("timeout" if left() <= 0 else "fail")
-    for _ in range(3):
-        if _stopped():
-            return "stopped"
-        if core.find_node(_nodes(adb), "Without media", "contains") is None:
-            break
-        _tap_text(adb, "Without media", timeout=8, match="contains", delay=1.0, stop=outer_stop)
+    if _wait_text(adb, "Without media", timeout=15, match="contains", stop=outer_stop):
+        for _ in range(3):
+            if _stopped():
+                return "stopped"
+            if core.find_node(_nodes(adb), "Without media", "contains") is None:
+                break
+            _tap_text(adb, "Without media", timeout=8, match="contains", delay=1.2, stop=outer_stop)
     if _wait_text(adb, "Quick Share", timeout=max(5, min(240, left())), stop=outer_stop):
         return "done"
     return "stopped" if _stopped() else ("timeout" if left() <= 0 else "fail")
