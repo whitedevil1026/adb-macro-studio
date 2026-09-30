@@ -692,6 +692,35 @@ def _csv_safe(v):
     return s
 
 
+def _csv_unsafe(s):
+    """Inverse of _csv_safe: strip the leading ' so a name read back from the CSV matches live."""
+    if len(s) >= 2 and s[0] == "'" and s[1] in ("=", "+", "-", "@", "\t", "\r"):
+        return s[1:]
+    return s
+
+
+def load_progress(csv_path):
+    """Read a prior exported_chats.csv so a run can RESUME. Returns (status, order, files, times)
+    where status maps chat-name -> the recorded status. Callers keep chats already 'ok' (skip
+    them) and re-queue everything else."""
+    status, order, files, times = {}, [], {}, {}
+    try:
+        with open(csv_path, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                nm = _csv_unsafe((row.get("chat") or "").strip())
+                if not nm:
+                    continue
+                if nm not in status:
+                    order.append(nm)
+                status[nm] = (row.get("status") or "").strip()
+                files[nm] = (_csv_unsafe(row.get("saved_file") or ""),
+                             row.get("sha256") or "", row.get("media") or "")
+                times[nm] = row.get("time") or ""
+    except FileNotFoundError:
+        pass
+    return status, order, files, times
+
+
 def save_names_csv(rows, path):
     """rows: list of (name, status). Writes a simple CSV; returns the path."""
     path = str(path)
@@ -716,7 +745,7 @@ class RollingBatch(threading.Thread):
     """
 
     def __init__(self, adb, case, size, emit, pause=None, csv_path=None,
-                 pc_name=PC_NAME, save_dir=SAVE_DIR):
+                 pc_name=PC_NAME, save_dir=SAVE_DIR, resume_from=None, start_from=None):
         super().__init__(daemon=True)
         self.adb, self.case, self.size, self.emit = adb, case, size, emit
         self._stop = threading.Event()
@@ -728,6 +757,8 @@ class RollingBatch(threading.Thread):
         self.order = []           # discovery order
         self.pc_name, self.save_dir = pc_name, save_dir
         self.csv_path = str(csv_path) if csv_path else str(Path(case.dir) / "exported_chats.csv")
+        self.resume_from = resume_from   # path to a prior CSV: skip its 'ok' chats, retry the rest
+        self.start_from = start_from     # chat name to scroll to and begin at (skip everything above)
 
     def stop(self):
         self._stop.set()
@@ -785,6 +816,43 @@ class RollingBatch(threading.Thread):
         off = int(h * 0.09)                    # small symmetric swing (~18% of the screen)
         self.adb.swipe(cx, cy + off, cx, cy - off, 900); time.sleep(0.8)
 
+    def _swipe_up(self):
+        w, h = self.size
+        cx, cy = w // 2, h // 2
+        off = int(h * 0.09)
+        self.adb.swipe(cx, cy - off, cx, cy + off, 900); time.sleep(0.8)
+
+    def _seek_chat(self, target, max_scrolls=120):
+        """Scroll from the top until `target` is on screen; mark every chat passed on the way as
+        'skipped' (we're deliberately starting later). Returns True if found."""
+        tgt = (target or "").strip().lower()
+        # jump to the very top first so "start from here" is deterministic
+        for _ in range(30):
+            if self._stop.is_set():
+                return False
+            before = [nm for _, nm in visible_chats(self.adb)]
+            self._swipe_up()
+            after = [nm for _, nm in visible_chats(self.adb)]
+            if after and after == before:
+                break                          # at the top
+        for _ in range(max_scrolls):
+            if self._stop.is_set():
+                return False
+            visible = [nm for _, nm in visible_chats(self.adb)]
+            if any(nm.strip().lower() == tgt for nm in visible):
+                return True
+            for nm in visible:                 # everything above the target is intentionally skipped
+                if nm not in self.status:
+                    self.status[nm] = "skipped"; self.order.append(nm)
+                    self.emit("discover", nm); self.emit("row", nm, "skipped")
+            self._write_csv()
+            before = visible
+            self._swipe_down()
+            after = [nm for _, nm in visible_chats(self.adb)]
+            if after and after == before:      # reached the bottom without finding it
+                return False
+        return False
+
     def _write_csv(self):
         try:
             now = core.now_iso()
@@ -829,6 +897,32 @@ class RollingBatch(threading.Thread):
                 self.emit("log", f"WARNING: save folder '{self.save_dir}' does not exist - "
                                  "received files won't be detected. Point Quick Share there.")
             self._ensure_list()
+
+            # RESUME: pre-load a prior run's CSV. Chats already 'ok' are kept (skipped); every
+            # other chat is re-queued as pending so it gets retried.
+            if self.resume_from:
+                st, od, fl, tm = load_progress(self.resume_from)
+                for nm in od:
+                    if nm not in self.order:
+                        self.order.append(nm)
+                    self.status[nm] = "ok" if st.get(nm) == "ok" else "pending"
+                    self.files[nm] = fl.get(nm, ("", "", ""))
+                    self.times[nm] = tm.get(nm, "")
+                    self.emit("discover", nm)
+                    self.emit("row", nm, self.status[nm])
+                done = sum(1 for nm in od if self.status.get(nm) == "ok")
+                self.emit("log", f"resume: {len(od)} chats loaded, {done} already ok (skipping "
+                                 f"those, retrying the rest)")
+                self._write_csv()
+
+            # START-FROM: scroll to a named chat and begin there (mark everything above as skipped).
+            if self.start_from:
+                self.emit("log", f"seeking start chat: {self.start_from}")
+                if self._seek_chat(self.start_from):
+                    self.emit("log", f"found '{self.start_from}' - starting from here")
+                else:
+                    self.emit("log", f"'{self.start_from}' not found - starting from the top")
+
             self.emit("log", f"rolling export started - CSV: {self.csv_path}")
             stale = 0
             empty_reads = 0
@@ -840,9 +934,16 @@ class RollingBatch(threading.Thread):
                     self.emit("log", "device disconnected - waiting up to 180s")
                     if not self._wait_device():
                         break
-                    time.sleep(1); self._ensure_list()
+                    time.sleep(1)
+                    keep_awake(self.adb, True); wake_unlock(self.adb)   # re-arm after reconnect
+                    self._ensure_list()
                 try:
                     visible = [nm for _, nm in visible_chats(self.adb)]
+                    if not visible:
+                        # screen unreadable at the top of the loop is often a LOCKED/OFF screen:
+                        # wake it, re-assert stay-on, and get back to the list before deciding.
+                        wake_unlock(self.adb); keep_awake(self.adb, True); self._ensure_list()
+                        visible = [nm for _, nm in visible_chats(self.adb)]
                     for nm in visible:
                         if nm not in self.status:
                             self.status[nm] = "pending"; self.order.append(nm)

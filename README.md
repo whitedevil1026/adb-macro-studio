@@ -235,6 +235,19 @@ and survives lists of hundreds of chats. Per chat it:
 *Resume pending* (retry rows still pending or failed), *Save CSV*, and *Stop* (halts within a few
 seconds — it also interrupts an in-progress export).
 
+### Resume after an interruption (lock / crash / disconnect)
+So you never have to redo work if the phone locks or the run stops midway:
+- **Resume from CSV…** — pick a previous run's `exported_chats.csv`. Chats already `ok` are
+  **skipped**; everything else (failed / pending / never-reached) is **re-queued and retried**.
+- **Start from chat** — type a chat name and the run scrolls to it and **begins there** (chats
+  above it are marked `skipped`). Handy to pick up exactly where it stopped.
+- The run also **keeps the screen awake** and, if the screen locks or the device drops, it **wakes
+  it, re-arms stay-on, and returns to the chat list** before continuing.
+
+> Note on missed chats: the batch *prevents* skips with generous page overlap rather than
+> detecting them after the fact — a chat that was ever scrolled past unread simply wouldn't appear
+> in the CSV. Resume + a re-scan is the way to be certain every chat is captured.
+
 ### Skip chats that take too long
 Some very large chats make the phone too busy for the screen-reader (Android can even kill the
 UI-dump helper under memory pressure). To stop one chat from stalling the whole run, each chat has

@@ -356,6 +356,18 @@ class BatchExportWindow(tk.Toplevel):
         self.dir_var = tk.StringVar(value=wb.SAVE_DIR)
         ttk.Entry(cfg, textvariable=self.dir_var, width=26).pack(side="left", padx=4)
 
+        # resume / start-from controls (recover after a lock/crash without redoing work)
+        cfg2 = ttk.Frame(self, padding=(6, 2))
+        cfg2.pack(fill="x")
+        ttk.Label(cfg2, text="Start from chat:").pack(side="left")
+        self.startfrom_var = tk.StringVar(value="")
+        ttk.Entry(cfg2, textvariable=self.startfrom_var, width=20).pack(side="left", padx=4)
+        self.resume_path = None
+        ttk.Button(cfg2, text="Resume from CSV...", command=self._pick_resume).pack(side="left", padx=(12, 0))
+        self.resume_lbl = ttk.Label(cfg2, text="(off)", foreground="#8a8")
+        self.resume_lbl.pack(side="left", padx=6)
+        ttk.Button(cfg2, text="clear", command=self._clear_resume).pack(side="left")
+
         mid = ttk.Frame(self, padding=6)
         mid.pack(fill="both", expand=True)
         self.tree = ttk.Treeview(mid, columns=("chat", "status"), show="headings",
@@ -458,6 +470,23 @@ class BatchExportWindow(tk.Toplevel):
         self.tree.selection_set(pend)
         self.start()
 
+    def _pick_resume(self):
+        from tkinter import filedialog
+        init = ""
+        try:
+            init = str(Path(self.app.case.dir).parent) if self.app.case else ""
+        except Exception:
+            pass
+        p = filedialog.askopenfilename(parent=self, title="Pick a prior exported_chats.csv to resume from",
+                                       initialdir=init, filetypes=[("CSV", "*.csv"), ("All files", "*.*")])
+        if p:
+            self.resume_path = p
+            self.resume_lbl.config(text="resume: " + Path(p).name, foreground="#0a7")
+
+    def _clear_resume(self):
+        self.resume_path = None
+        self.resume_lbl.config(text="(off)", foreground="#8a8")
+
     def rolling_start(self):
         """Auto page-by-page: scan a screenful, export the undone ones, scroll, repeat. Writes CSV."""
         if not self.app.adb:
@@ -479,7 +508,9 @@ class BatchExportWindow(tk.Toplevel):
         self.batch = wb.RollingBatch(self.app.adb, self.app.case, self.app.cur_size,
                                      self._emit, pause=self.pause_evt,
                                      pc_name=self.pc_var.get().strip() or wb.PC_NAME,
-                                     save_dir=self.dir_var.get().strip() or wb.SAVE_DIR)
+                                     save_dir=self.dir_var.get().strip() or wb.SAVE_DIR,
+                                     resume_from=self.resume_path,
+                                     start_from=self.startfrom_var.get().strip() or None)
         self._log("AUTO scan + export starting (page by page)")
         self._log(f"CSV file: {self.batch.csv_path}")
         self.batch.start()
