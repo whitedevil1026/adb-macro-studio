@@ -230,6 +230,10 @@ def build(folder, out_path, max_embed_mb, owner, mode="embed"):
     data = {"owner": owner or "", "chats": chats,
             "generated": __import__("datetime").datetime.now().isoformat(timespec="seconds")}
     payload = json.dumps(data, ensure_ascii=False)
+    # make the JSON safe to inline inside a <script>: U+2028/U+2029 are valid JSON but illegal in
+    # JS string literals, and "</" could prematurely close the tag. Both escapes are valid JSON.
+    payload = (payload.replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
+                      .replace("</", "<\\/"))
     htmldoc = HTML_TEMPLATE.replace("/*__DATA__*/", "window.__CHATS__ = " + payload + ";")
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(htmldoc)
@@ -454,6 +458,10 @@ renderChatList('');
 
 
 def main():
+    try:                                        # chat names contain emoji; keep console output safe
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
     ap = argparse.ArgumentParser(description="Build a self-contained WhatsApp-Web-style HTML viewer from export zips.")
     ap.add_argument("folder", help="folder containing WhatsApp export .zip files")
     ap.add_argument("-o", "--out", default=None, help="output .html (default: <folder>/chat_viewer.html)")
