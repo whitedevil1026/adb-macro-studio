@@ -257,9 +257,12 @@ it's always current — even mid-run and even for failures. Columns:
 | `time` | When **that** chat finished (frozen per row, not the last-write time) |
 
 Common `status` values: `ok`, `fail-export` (couldn't produce the file), `fail-timeout` (over the
-per-chat budget), `fail-transfer` (file never arrived), `fail-noshare`/`fail-pcpick` (couldn't find
-Quick Share or this PC in the picker), `fail-notfound` (chat row not found), `fail-device` (phone
-disconnected too long).
+per-chat budget), `fail-sent` (the phone's Quick Share showed **"Failed"** - the transfer dropped,
+usually Bluetooth/Wi-Fi), `fail-transfer` (the file never arrived within the timeout - PC not
+receiving, asleep, or wrong save folder), `fail-noshare`/`fail-pcpick` (couldn't find Quick Share
+or this PC in the picker), `fail-notfound` (chat row not found), `fail-device` (phone disconnected
+too long). The phone's Quick Share page is read live during the send, so a **"Failed"** is caught
+in seconds (fast retry) and a **"Sent"** is logged as progress.
 
 > **Limitation:** chats are tracked by display name. Two chats with the **identical** name are
 > de-duplicated — only the first is exported. Rename one on the phone if you need both.

@@ -36,17 +36,20 @@ def sha256(path) -> str:
     return h.hexdigest()
 
 
-def wait_for_new_file(folder, before: dict, timeout=120, stable_secs=2.0, poll=0.5):
+def wait_for_new_file(folder, before: dict, timeout=120, stable_secs=2.0, poll=0.5, abort=None):
     """Wait until a NEW file (not in `before`) appears in `folder` and its size stops
     growing for `stable_secs`. Returns (path, size, sha256) or None on timeout.
 
     `before` is a snapshot() taken just before the transfer was triggered.
-    """
+    `abort`, if given, is called each poll; if it returns True we stop early and return None
+    (used to bail as soon as the sender shows the transfer 'Failed')."""
     folder = str(folder)
     deadline = time.time() + timeout
     stable_since = {}
     last_size = {}
     while time.time() < deadline:
+        if abort is not None and abort():
+            return None
         now = snapshot(folder)
         for name, size in now.items():
             if name in before and before[name] == size:

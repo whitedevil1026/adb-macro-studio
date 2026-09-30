@@ -39,7 +39,7 @@ MAX_SEND_SECONDS = 180                      # the actual file transfer keeps its
 # the whole export+send a few times before giving up. A mega-chat 'fail-timeout' is NOT retried
 # (retrying it would just time out again), and 'fail-notfound' is handled separately.
 SHARE_RETRIES = 2                           # extra attempts after the first (so up to 3 total)
-SHARE_RETRY_STATUSES = ("fail-transfer", "fail-noshare", "fail-pcpick", "fail-export")
+SHARE_RETRY_STATUSES = ("fail-transfer", "fail-sent", "fail-noshare", "fail-pcpick", "fail-export")
 
 # Learned tap positions for "Quick Share" and the PC, per screen size. On a mega-chat the
 # phone is too busy for uiautomator to read the share sheet, so we fall back to these.
@@ -440,11 +440,38 @@ def export_and_send(adb, case, size, emit_log=lambda m: None, outer_stop=None,
         _back_to_list(adb)
         return ("fail-timeout" if _left() <= 0 else "fail-pcpick"), None, None, media["mode"]
 
-    # fail fast on a blind (unreliable) send so a mega-chat can't waste 10 min
+    # Wait for the file on the PC (definitive success), while ALSO reading the phone's Quick Share
+    # status: if it shows "Failed" we bail immediately (fast retry) instead of waiting the whole
+    # timeout; "Sent" is logged as progress. Fail fast on a blind send so a mega-chat can't waste
+    # 10 min.
     emit_log(f"sent to {pc_name}; waiting for the file to arrive...")
-    res = bt.wait_for_new_file(save_dir, before, timeout=90 if blind else 600)
+    phone = {"next": 0.0, "sent": False, "failed": False}
+
+    def _abort():
+        if outer_stop is not None and outer_stop.is_set():
+            return True
+        now = time.time()
+        if now < phone["next"]:
+            return False
+        phone["next"] = now + 4.0                       # throttle phone reads
+        nodes = _nodes(adb)
+        if core.find_node(nodes, "Failed", "contains"):
+            phone["failed"] = True
+            emit_log("phone shows Quick Share 'Failed'")
+            return True
+        if not phone["sent"] and core.find_node(nodes, "Sent", "contains"):
+            phone["sent"] = True
+            emit_log("phone shows Quick Share 'Sent' - finalising on PC")
+        return False
+
+    res = bt.wait_for_new_file(save_dir, before, timeout=90 if blind else 600, abort=_abort)
     _back_to_list(adb)
     if not res:
+        # distinct reasons: the phone actively reported the send "Failed" (transfer dropped -
+        # Bluetooth/Wi-Fi) vs the file simply never arrived within the timeout (PC not receiving,
+        # asleep, wrong save folder). Both are retried.
+        if phone["failed"]:
+            return "fail-sent", None, None, media["mode"]
         return "fail-transfer", None, None, media["mode"]
     path, nbytes, digest = res
     try:
