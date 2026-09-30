@@ -267,6 +267,27 @@ in seconds (fast retry) and a **"Sent"** is logged as progress.
 > **Limitation:** chats are tracked by display name. Two chats with the **identical** name are
 > de-duplicated — only the first is exported. Rename one on the phone if you need both.
 
+### Viewing the exported chats — offline WhatsApp-Web-style viewer
+[`chat_viewer.py`](chat_viewer.py) turns a folder of export `.zip`s into **one self-contained,
+offline HTML page** that reads like WhatsApp Web — a searchable chat list on the left, message
+bubbles with inline images/video/audio on the right, and global + in-chat search.
+
+```bash
+python chat_viewer.py "E:\quickshare"
+# -> writes E:\quickshare\chat_viewer.html   (just double-click to open; no internet needed)
+```
+
+Options:
+- `-o viewer.html` — output path (default `<folder>/chat_viewer.html`).
+- `--max-embed-mb N` — embed media up to N MB each (default **20**); larger media shows a labelled
+  placeholder instead of bloating the file. Use `--max-embed-mb 0` to embed **everything**
+  (portable but can be gigabytes for big media).
+- `--owner "Your Name"` — right-align your own messages as "you" (auto-detected otherwise; WhatsApp
+  writes the owner's own messages as "You").
+
+It's pure standard library + vanilla JS, fully offline, and read-only (nothing is written back to
+the exports). Media is embedded as base64 so the single `.html` is portable.
+
 ---
 
 ## 8. Where things are saved
