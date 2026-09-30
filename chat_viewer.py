@@ -258,197 +258,239 @@ HTML_TEMPLATE = r"""<!doctype html>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Chat Viewer</title>
 <style>
-  :root{--bg:#111b21;--panel:#202c33;--panel2:#111b21;--in:#202c33;--out:#005c4b;
-        --txt:#e9edef;--muted:#8696a0;--line:#2a3942;--accent:#00a884;--hl:#f6c344;}
+  :root{--bg:#0b141a;--side:#111b21;--panel:#202c33;--hd:#202c33;--in:#202c33;--out:#005c4b;
+        --txt:#e9edef;--muted:#8696a0;--line:#222d34;--accent:#00a884;--hl:#f6c344;--cur:#ff8a3d;--snd:#53bdeb;}
   *{box-sizing:border-box}
-  body{margin:0;font-family:Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:var(--panel2);
-       color:var(--txt);height:100vh;overflow:hidden}
+  [hidden]{display:none!important}
+  html,body{margin:0;height:100%}
+  body{font-family:"Segoe UI",Roboto,Helvetica,Arial,sans-serif;background:var(--bg);color:var(--txt);overflow:hidden}
+  ::-webkit-scrollbar{width:8px;height:8px}
+  ::-webkit-scrollbar-thumb{background:#374248;border-radius:4px}
+  ::-webkit-scrollbar-thumb:hover{background:#4a575f}
   .app{display:flex;height:100vh}
-  .side{width:360px;min-width:300px;border-right:1px solid var(--line);display:flex;flex-direction:column;background:var(--panel2)}
-  .side h1{font-size:15px;margin:0;padding:14px 16px;background:var(--panel);color:var(--muted);font-weight:600}
-  .search{padding:8px;background:var(--panel2)}
-  .search input{width:100%;padding:9px 12px;border-radius:8px;border:none;background:var(--panel);
-                color:var(--txt);font-size:14px;outline:none}
+  /* sidebar */
+  .side{width:min(32vw,400px);min-width:280px;display:flex;flex-direction:column;background:var(--side);
+        border-right:1px solid var(--line);position:relative}
+  .side-hd{display:flex;align-items:center;justify-content:space-between;padding:15px 16px;background:var(--hd);font-weight:600;font-size:16px}
+  .side-hd .n{font-size:12px;color:var(--muted);font-weight:400}
+  .side-search{padding:8px 10px}
+  .side-search input{width:100%;padding:9px 16px;border-radius:20px;border:none;background:var(--panel);color:var(--txt);font-size:14px;outline:none}
   .chats{overflow-y:auto;flex:1}
-  .chat{padding:11px 14px;border-bottom:1px solid var(--line);cursor:pointer;display:flex;gap:12px;align-items:center}
-  .chat:hover{background:var(--panel)}
-  .chat.active{background:var(--line)}
-  .avatar{width:44px;height:44px;border-radius:50%;background:var(--accent);color:#04231d;
-          display:flex;align-items:center;justify-content:center;font-weight:700;flex-shrink:0}
-  .chat .meta{overflow:hidden}
-  .chat .nm{font-size:15px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-  .chat .pv{font-size:13px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-  .main{flex:1;display:flex;flex-direction:column;background:#0b141a;
-        background-image:linear-gradient(rgba(11,20,26,.95),rgba(11,20,26,.95))}
-  .top{padding:12px 16px;background:var(--panel);border-bottom:1px solid var(--line);
-       display:flex;align-items:center;gap:12px}
-  .top .nm{font-weight:600}.top .sub{font-size:12px;color:var(--muted)}
-  .top .cs{margin-left:auto;display:flex;gap:6px;align-items:center}
-  .top .cs input{padding:6px 10px;border-radius:6px;border:none;background:var(--panel2);color:var(--txt);outline:none}
-  .msgs{flex:1;overflow-y:auto;padding:18px 8%;display:flex;flex-direction:column;gap:3px}
-  .row{display:flex}.row.me{justify-content:flex-end}
-  .bub{max-width:70%;padding:6px 9px 8px;border-radius:8px;background:var(--in);position:relative;
-       font-size:14.2px;line-height:1.35;white-space:pre-wrap;word-wrap:break-word}
+  .chat{padding:10px 14px;cursor:pointer;display:flex;gap:13px;align-items:center;border-bottom:1px solid rgba(255,255,255,.04)}
+  .chat:hover{background:#182229}.chat.active{background:#2a3942}
+  .avatar{width:46px;height:46px;border-radius:50%;color:#04231d;flex-shrink:0;display:flex;
+          align-items:center;justify-content:center;font-weight:700;font-size:18px}
+  .chat .meta{overflow:hidden;flex:1}
+  .chat .nm{font-size:15.5px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .chat .pv{font-size:13px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:2px}
+  /* main */
+  .main{flex:1;display:flex;flex-direction:column;min-width:0;background:var(--bg)}
+  .top{display:flex;align-items:center;gap:12px;padding:9px 16px;background:var(--hd);border-bottom:1px solid var(--line)}
+  .top .av{width:40px;height:40px;font-size:16px}
+  .top .ti{min-width:0;flex:1}
+  .top .nm{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .top .sub{font-size:12px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .top .tools{display:flex;align-items:center;gap:6px}
+  .top select{background:var(--panel);color:var(--txt);border:none;border-radius:6px;padding:6px 8px;outline:none;font-size:12px;max-width:130px}
+  .iconbtn{background:transparent;border:none;color:var(--muted);cursor:pointer;font-size:16px;padding:7px 9px;border-radius:50%;line-height:1}
+  .iconbtn:hover{background:rgba(255,255,255,.08);color:var(--txt)}
+  /* in-chat search bar */
+  .cbar{display:flex;align-items:center;gap:8px;padding:8px 14px;background:#111b21;border-bottom:1px solid var(--line)}
+  .cbar input{flex:1;padding:8px 14px;border-radius:8px;border:none;background:var(--panel);color:var(--txt);outline:none;font-size:14px}
+  .cbar .cnt{font-size:12px;color:var(--muted);min-width:46px;text-align:center}
+  /* messages */
+  .msgs{flex:1;overflow-y:auto;padding:16px 6%;display:flex;flex-direction:column;gap:2px}
+  .day{align-self:center;background:#182229;color:var(--muted);font-size:12px;padding:5px 12px;border-radius:8px;margin:12px 0 8px;box-shadow:0 1px 1px rgba(0,0,0,.2)}
+  .row{display:flex;margin-top:2px}.row.me{justify-content:flex-end}.row.grp{margin-top:9px}
+  .bub{max-width:74%;padding:6px 9px 8px;border-radius:8px;background:var(--in);font-size:14.2px;line-height:1.36;
+       white-space:pre-wrap;word-wrap:break-word;box-shadow:0 1px .5px rgba(0,0,0,.15);transition:background .5s}
   .row.me .bub{background:var(--out)}
-  .bub .snd{font-size:12.5px;font-weight:600;color:#53bdeb;margin-bottom:2px}
-  .bub .tm{font-size:11px;color:var(--muted);float:right;margin:6px 0 -2px 10px}
-  .bub img,.bub video{max-width:100%;border-radius:6px;display:block;margin:2px 0}
-  .bub audio{width:240px;margin:3px 0}
-  .bub .file{display:inline-block;padding:8px 10px;background:rgba(255,255,255,.06);border-radius:6px;color:var(--txt);text-decoration:none;margin:2px 0}
-  .bub .ph{font-size:12px;color:var(--muted);font-style:italic;padding:4px 0}
-  .sys{align-self:center;background:rgba(255,255,255,.05);color:var(--muted);font-size:12.5px;
-       padding:5px 12px;border-radius:8px;margin:6px 0}
-  mark{background:var(--hl);color:#000;border-radius:2px}
-  .empty{margin:auto;color:var(--muted);text-align:center}
-  .hit{font-size:12px;color:var(--muted);padding:2px 8px}
-  .gres{position:absolute;top:52px;left:0;right:0;background:var(--panel);max-height:60vh;overflow:auto;
-        border-bottom:1px solid var(--line);z-index:5}
-  .gres .g{padding:8px 14px;border-bottom:1px solid var(--line);cursor:pointer}
-  .gres .g:hover{background:var(--line)}
-  .gres .g .c{font-size:12px;color:var(--accent)}
-  .side{position:relative}
+  .bub .snd{font-size:12.7px;font-weight:600;color:var(--snd);margin-bottom:2px}
+  .bub .tm{font-size:11px;color:var(--muted);float:right;margin:6px 0 -3px 12px;user-select:none}
+  .bub img,.bub video{max-width:320px;max-height:400px;border-radius:6px;display:block;margin:2px 0;cursor:pointer}
+  .bub audio{width:250px;margin:3px 0}
+  .bub .file{display:inline-flex;gap:8px;align-items:center;padding:9px 12px;background:rgba(0,0,0,.2);border-radius:8px;color:var(--txt);text-decoration:none;margin:2px 0}
+  .bub .ph{font-size:12px;color:var(--muted);font-style:italic;padding:6px 8px;background:rgba(0,0,0,.15);border-radius:6px;margin:2px 0}
+  .sys{align-self:center;background:#182229;color:var(--muted);font-size:12.5px;padding:5px 12px;border-radius:8px;margin:6px 0;max-width:80%;text-align:center}
+  mark{background:var(--hl);color:#000;border-radius:2px;padding:0 1px}
+  mark.cur{background:var(--cur);color:#000}
+  .empty{margin:auto;color:var(--muted);text-align:center;font-size:15px}
+  /* global search results */
+  .gres{position:absolute;top:107px;left:0;right:0;bottom:0;background:var(--side);overflow:auto;z-index:5}
+  .gres .g{padding:9px 14px;border-bottom:1px solid var(--line);cursor:pointer}
+  .gres .g:hover{background:#182229}
+  .gres .g .c{font-size:12.5px;color:var(--accent);margin-bottom:2px}
+  .gres .g .s{font-size:13px;color:var(--txt);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .gres .more{padding:8px 14px;font-size:12px;color:var(--muted)}
+  /* lightbox */
+  .lb{position:fixed;inset:0;background:rgba(0,0,0,.92);display:none;align-items:center;justify-content:center;z-index:50;cursor:zoom-out}
+  .lb img,.lb video{max-width:92vw;max-height:92vh;border-radius:4px}
+  @media(max-width:640px){.side{width:46vw;min-width:0}.msgs{padding:14px 4%}.bub{max-width:86%}}
 </style></head>
 <body>
 <div class="app">
-  <div class="side">
-    <h1>Chats <span id="cinfo" style="float:right;font-weight:400"></span></h1>
-    <div class="search"><input id="q" placeholder="Search chats or messages..."></div>
-    <div id="gres" class="gres" style="display:none"></div>
+  <aside class="side">
+    <div class="side-hd"><span>Chats</span><span class="n" id="cinfo"></span></div>
+    <div class="side-search"><input id="q" placeholder="Search all chats &amp; messages"></div>
+    <div id="gres" class="gres" hidden></div>
     <div id="chats" class="chats"></div>
-  </div>
-  <div class="main">
-    <div class="top" id="top" style="display:none">
-      <div><div class="nm" id="tnm"></div><div class="sub" id="tsub"></div></div>
-      <div class="cs">
+  </aside>
+  <main class="main">
+    <header class="top" id="top" hidden>
+      <div class="avatar av" id="tav"></div>
+      <div class="ti"><div class="nm" id="tnm"></div><div class="sub" id="tsub"></div></div>
+      <div class="tools">
         <select id="owner" title="Which sender is 'you' (right side)"></select>
-        <input id="cs" placeholder="Find in chat">
-        <span class="hit" id="hit"></span>
+        <button class="iconbtn" id="csBtn" title="Search in this chat">&#128269;</button>
       </div>
+    </header>
+    <div class="cbar" id="cbar" hidden>
+      <input id="cs" placeholder="Search in this chat...">
+      <span class="cnt" id="hit"></span>
+      <button class="iconbtn" id="prev" title="Previous match (Shift+Enter)">&#9650;</button>
+      <button class="iconbtn" id="next" title="Next match (Enter)">&#9660;</button>
+      <button class="iconbtn" id="csClose" title="Close">&#10005;</button>
     </div>
-    <div class="msgs" id="msgs"><div class="empty">Select a chat on the left</div></div>
-  </div>
+    <div class="msgs" id="msgs"><div class="empty">Select a chat to view its messages</div></div>
+  </main>
 </div>
+<div class="lb" id="lb"></div>
 <script>
 /*__DATA__*/
 const DATA = window.__CHATS__ || {chats:[]};
 const chats = DATA.chats;
-let active = -1, ownerByChat = {};
-const $ = s => document.querySelector(s);
-const esc = s => (s||"").replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-function initial(n){ return (n||"?").trim().charAt(0).toUpperCase(); }
+let active=-1, ownerByChat={}, marks=[], curMark=-1;
+const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
+const esc=s=>(s||"").replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const initial=n=>((n||"?").trim().charAt(0)||"?").toUpperCase();
+const reEsc=q=>q.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
+const AV=['#00a884','#53bdeb','#f6a935','#e5738a','#9b8cff','#5fbf77','#f27c74','#48b5c4','#c98bdb'];
+function avColor(n){let h=0;for(const ch of (n||"")) h=(h*31+ch.charCodeAt(0))>>>0;return AV[h%AV.length];}
+const dayOf=ts=>(ts||"").split(', ')[0]||"";
+const timeOf=ts=>{const p=(ts||"").split(', ');return p.length>1?p.slice(1).join(', '):"";};
 
-document.getElementById('cinfo').textContent = chats.length + ' chats';
+$('#cinfo').textContent = chats.length+' chats';
 
 function guessOwner(c){
-  // heuristic: in a 1:1, the contact (chat name) is the OTHER person -> "me" = the other sender
-  if (ownerByChat[c.name] !== undefined) return ownerByChat[c.name];
-  if (DATA.owner && c.senders.includes(DATA.owner)) return DATA.owner;
-  if (c.senders.includes("You")) return "You";
-  const others = c.senders.filter(s => s.toLowerCase() !== c.name.toLowerCase());
-  return (c.senders.length === 2 && others.length === 1) ? others[0] : "";
+  if(ownerByChat[c.name]!==undefined) return ownerByChat[c.name];
+  if(DATA.owner && c.senders.includes(DATA.owner)) return DATA.owner;
+  if(c.senders.includes("You")) return "You";                 // WhatsApp writes the owner as "You"
+  const others=c.senders.filter(s=>s.toLowerCase()!==c.name.toLowerCase());
+  return (c.senders.length===2 && others.length===1)?others[0]:"";
 }
 
 function renderChatList(filter){
-  const box = $('#chats'); box.innerHTML='';
-  const f = (filter||"").toLowerCase();
+  const box=$('#chats'); box.innerHTML=''; const f=(filter||"").toLowerCase();
   chats.forEach((c,i)=>{
     if(f && !c.name.toLowerCase().includes(f)) return;
     const d=document.createElement('div'); d.className='chat'+(i===active?' active':'');
-    d.innerHTML=`<div class="avatar">${esc(initial(c.name))}</div>
-      <div class="meta"><div class="nm">${esc(c.name)}</div>
-      <div class="pv">${esc(c.preview||'')}</div></div>`;
-    d.onclick=()=>openChat(i);
-    box.appendChild(d);
+    d.innerHTML=`<div class="avatar" style="background:${avColor(c.name)}">${esc(initial(c.name))}</div>
+      <div class="meta"><div class="nm">${esc(c.name)}</div><div class="pv">${esc(c.preview||'')}</div></div>`;
+    d.onclick=()=>openChat(i); box.appendChild(d);
   });
+}
+
+function mediaHtml(m){
+  const src=m.src||m.data;                       // folder mode = relative path, embed mode = data URI
+  if(src){
+    if(m.kind==='image') return `<img loading="lazy" src="${src}" onclick="lightbox('img',this.src)">`;
+    if(m.kind==='video') return `<video controls preload="none" src="${src}"></video>`;
+    if(m.kind==='audio') return `<audio controls preload="none" src="${src}"></audio>`;
+    return `<a class="file" href="${src}" download="${esc(m.name)}">&#128206; ${esc(m.name)}</a>`;
+  }
+  return `<div class="ph">&#128206; ${esc(m.name)} — not embedded (${(m.size/1024).toFixed(0)} KB)</div>`;
 }
 
 function openChat(i, scrollToIdx){
   active=i; renderChatList($('#q').value);
   const c=chats[i];
-  $('#top').style.display='flex';
+  $('#top').hidden=false;
+  const av=$('#tav'); av.style.background=avColor(c.name); av.textContent=initial(c.name);
   $('#tnm').textContent=c.name;
   $('#tsub').textContent=`${c.count} messages · ${c.senders.join(', ')}`;
-  const sel=$('#owner'); sel.innerHTML='<option value="">(auto)</option>'+
+  const sel=$('#owner'); sel.innerHTML='<option value="">auto</option>'+
     c.senders.map(s=>`<option${guessOwner(c)===s?' selected':''}>${esc(s)}</option>`).join('');
   sel.onchange=()=>{ownerByChat[c.name]=sel.value; renderMsgs(c);};
-  $('#cs').value=''; $('#hit').textContent='';
+  resetCs();
   renderMsgs(c, scrollToIdx);
 }
 
-function mediaHtml(m){
-  const src = m.src || m.data;                 // folder mode uses a relative path, embed mode a data URI
-  if(src){
-    if(m.kind==='image') return `<img loading="lazy" src="${src}">`;
-    if(m.kind==='video') return `<video controls preload="none" src="${src}"></video>`;
-    if(m.kind==='audio') return `<audio controls preload="none" src="${src}"></audio>`;
-    return `<a class="file" href="${src}" download="${esc(m.name)}">📎 ${esc(m.name)}</a>`;
-  }
-  const kb=(m.size/1024).toFixed(0);
-  return `<div class="ph">📎 ${esc(m.name)} — not embedded (${kb} KB, over the size cap)</div>`;
-}
-
 function renderMsgs(c, scrollToIdx){
-  const owner=guessOwner(c);
-  const box=$('#msgs'); box.innerHTML='';
+  const owner=guessOwner(c); const box=$('#msgs'); box.innerHTML='';
+  let lastDay=null, lastSender=null;
   c.messages.forEach((m,idx)=>{
+    const d=dayOf(m.ts);
+    if(d && d!==lastDay){const dv=document.createElement('div');dv.className='day';dv.textContent=d;box.appendChild(dv);lastDay=d;lastSender=null;}
     if(m.sender===null){
-      const s=document.createElement('div'); s.className='sys'; s.textContent=m.text; box.appendChild(s); return;
+      const s=document.createElement('div');s.className='sys';s.textContent=m.text;box.appendChild(s);lastSender=null;return;
     }
-    const me = owner && m.sender===owner;
-    const row=document.createElement('div'); row.className='row'+(me?' me':'');
-    let media=(m.media||[]).map(mediaHtml).join('');
-    const txt = m.text ? esc(m.text) : '';
-    row.innerHTML=`<div class="bub" data-i="${idx}">${me?'':`<div class="snd">${esc(m.sender)}</div>`}
-      ${media}${txt?`<span class="t">${txt}</span>`:''}<span class="tm">${esc(m.ts.split(', ').pop())}</span></div>`;
-    box.appendChild(row);
+    const me=owner && m.sender===owner;
+    const grp=m.sender!==lastSender;
+    const row=document.createElement('div');row.className='row'+(me?' me':'')+(grp?' grp':'');
+    const media=(m.media||[]).map(mediaHtml).join('');
+    const txt=m.text?`<span class="t">${esc(m.text)}</span>`:'';
+    row.innerHTML=`<div class="bub" data-i="${idx}">${(!me&&grp)?`<div class="snd">${esc(m.sender)}</div>`:''}${media}${txt}<span class="tm">${esc(timeOf(m.ts))}</span></div>`;
+    box.appendChild(row); lastSender=m.sender;
   });
   if(scrollToIdx!=null){
     const el=box.querySelector(`.bub[data-i="${scrollToIdx}"]`);
-    if(el){el.scrollIntoView({block:'center'}); el.style.outline='2px solid var(--accent)';}
+    if(el){el.scrollIntoView({block:'center'});el.style.background='#0a3d34';setTimeout(()=>el.style.background='',1600);}
   } else box.scrollTop=box.scrollHeight;
 }
 
-// in-chat search
-$('#cs').addEventListener('input', e=>{
-  if(active<0) return;
-  const q=e.target.value.toLowerCase(); const c=chats[active];
-  renderMsgs(c);
-  if(!q){$('#hit').textContent='';return;}
-  let n=0, first=null;
-  document.querySelectorAll('#msgs .bub .t').forEach(sp=>{
-    const t=sp.textContent; if(t.toLowerCase().includes(q)){
-      n++; if(first===null) first=sp.closest('.bub');
-      sp.innerHTML=esc(t).replace(new RegExp('('+q.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')+')','ig'),'<mark>$1</mark>');
-    }
-  });
-  $('#hit').textContent=n?`${n} match${n>1?'es':''}`:'no matches';
-  if(first) first.scrollIntoView({block:'center'});
-});
+/* image / video lightbox */
+function lightbox(kind,src){const lb=$('#lb');lb.innerHTML=`<img src="${src}">`;lb.style.display='flex';}
+$('#lb').onclick=()=>{$('#lb').style.display='none';$('#lb').innerHTML='';};
 
-// global search (chats + messages)
+/* in-chat search with next/prev navigation */
+function resetCs(){$('#cbar').hidden=true;$('#cs').value='';$('#hit').textContent='';marks=[];curMark=-1;}
+function closeCs(){resetCs(); if(active>=0) renderMsgs(chats[active]);}
+$('#csBtn').onclick=()=>{ if($('#cbar').hidden){$('#cbar').hidden=false;$('#cs').focus();} else closeCs(); };
+$('#csClose').onclick=closeCs;
+$('#prev').onclick=()=>nav(-1);
+$('#next').onclick=()=>nav(1);
+$('#cs').addEventListener('input',runCs);
+$('#cs').addEventListener('keydown',e=>{
+  if(e.key==='Enter'){e.preventDefault(); e.shiftKey?nav(-1):nav(1);}
+  else if(e.key==='Escape') closeCs();
+});
+function runCs(){
+  if(active<0) return;
+  renderMsgs(chats[active]); marks=[]; curMark=-1;
+  const q=$('#cs').value.trim(); if(!q){$('#hit').textContent='';return;}
+  const ql=q.toLowerCase();
+  $$('#msgs .bub .t').forEach(sp=>{
+    if(sp.textContent.toLowerCase().includes(ql))
+      sp.innerHTML=esc(sp.textContent).replace(new RegExp('('+reEsc(q)+')','ig'),'<mark>$1</mark>');
+  });
+  marks=$$('#msgs mark');
+  if(!marks.length){$('#hit').textContent='0/0';return;}
+  nav(1);
+}
+function nav(dir){
+  if(!marks.length) return;
+  if(curMark>=0 && marks[curMark]) marks[curMark].classList.remove('cur');
+  curMark=(curMark+dir+marks.length)%marks.length;
+  const mk=marks[curMark]; mk.classList.add('cur'); mk.scrollIntoView({block:'center'});
+  $('#hit').textContent=`${curMark+1}/${marks.length}`;
+}
+
+/* global search across all chats */
 $('#q').addEventListener('input', e=>{
-  const q=e.target.value.trim().toLowerCase();
-  renderChatList(q);
-  const g=$('#gres');
-  if(q.length<2){g.style.display='none';return;}
+  const q=e.target.value.trim().toLowerCase(); renderChatList(q); const g=$('#gres');
+  if(q.length<2){g.hidden=true; return;}
   const hits=[];
   chats.forEach((c,ci)=>c.messages.forEach((m,mi)=>{
-    if(m.text && m.text.toLowerCase().includes(q)){
-      hits.push({ci,mi,name:c.name,sender:m.sender||'system',text:m.text});
-    }
+    if(m.text && m.text.toLowerCase().includes(q)) hits.push({ci,mi,name:c.name,sender:m.sender||'system',text:m.text});
   }));
-  if(!hits.length){g.style.display='none';return;}
-  g.style.display='block';
-  g.innerHTML=hits.slice(0,200).map(h=>{
+  if(!hits.length){g.hidden=true; return;}
+  g.hidden=false;
+  g.innerHTML=hits.slice(0,300).map(h=>{
     const i=h.text.toLowerCase().indexOf(q);
-    const snip=esc(h.text.substring(Math.max(0,i-25),i+45));
-    return `<div class="g" data-ci="${h.ci}" data-mi="${h.mi}">
-      <div class="c">${esc(h.name)} · ${esc(h.sender)}</div><div>…${snip}…</div></div>`;
-  }).join('') + (hits.length>200?`<div class="hit">${hits.length-200} more…</div>`:'');
-  g.querySelectorAll('.g').forEach(el=>el.onclick=()=>{
-    g.style.display='none'; $('#q').value='';
-    openChat(+el.dataset.ci, +el.dataset.mi);
-  });
+    const snip=esc(h.text.substring(Math.max(0,i-24),i+50));
+    return `<div class="g" data-ci="${h.ci}" data-mi="${h.mi}"><div class="c">${esc(h.name)} · ${esc(h.sender)}</div><div class="s">…${snip}…</div></div>`;
+  }).join('') + (hits.length>300?`<div class="more">${hits.length-300} more matches…</div>`:'');
+  $$('#gres .g').forEach(el=>el.onclick=()=>{g.hidden=true; $('#q').value=''; renderChatList(''); openChat(+el.dataset.ci,+el.dataset.mi);});
 });
 
 renderChatList('');
