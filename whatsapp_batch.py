@@ -99,7 +99,20 @@ def _find_chat_node(adb, name):
 
 
 def on_chat_list(adb):
-    return core.find_node(_nodes(adb), LIST_MARKER, "contains") is not None
+    """True  = on the chat list,
+    False = a readable screen that is NOT the list (safe to press BACK),
+    None  = the screen could not be read - DO NOT press BACK (retry the read instead).
+    Treating an unreadable dump as 'not on the list' was pressing BACK while actually on
+    the list, which minimises/closes WhatsApp."""
+    nodes = _nodes(adb)
+    if not nodes:
+        return None
+    if core.find_node(nodes, LIST_MARKER, "contains") is not None:
+        return True
+    # robust fallback: several chat-name rows on screen means we're on the list, even if the
+    # search-hint text differs by WhatsApp version/locale (an open chat shows no such rows).
+    rows = [n for n in nodes if n["id"].endswith(CONTACT_ID) and n["text"].strip()]
+    return len(rows) >= 2
 
 
 def keep_awake(adb, on=True):
@@ -229,10 +242,13 @@ def _wait_node(adb, text, timeout=30, match="contains", stop=None):
     return None
 
 
-def _back_to_list(adb, tries=6):
+def _back_to_list(adb, tries=8):
     for _ in range(tries):
-        if on_chat_list(adb):
+        st = on_chat_list(adb)
+        if st:
             return True
+        if st is None:                    # unreadable screen: retry the read, never BACK blindly
+            time.sleep(1.0); continue
         adb.key("BACK"); time.sleep(1.2)
     # last resort: bring WhatsApp back to the front
     try:
@@ -240,10 +256,13 @@ def _back_to_list(adb, tries=6):
     except core.AdbError:
         pass
     for _ in range(4):
-        if on_chat_list(adb):
+        st = on_chat_list(adb)
+        if st:
             return True
+        if st is None:
+            time.sleep(1.0); continue
         adb.key("BACK"); time.sleep(1.2)
-    return on_chat_list(adb)
+    return bool(on_chat_list(adb))
 
 
 def export_and_send(adb, case, size, emit_log=lambda m: None, outer_stop=None,
@@ -404,11 +423,14 @@ class WhatsAppBatch(threading.Thread):
         return False
 
     def _ensure_list(self):
-        for _ in range(6):
-            if on_chat_list(self.adb):
+        for _ in range(8):
+            st = on_chat_list(self.adb)
+            if st:
                 return True
+            if st is None:                # unreadable: retry, don't BACK out of WhatsApp
+                time.sleep(1.0); continue
             self.adb.key("BACK"); time.sleep(1.2)
-        return on_chat_list(self.adb)
+        return bool(on_chat_list(self.adb))
 
     def _swipe_down(self):
         w, h = self.size
@@ -584,22 +606,25 @@ class RollingBatch(threading.Thread):
         return False
 
     def _ensure_list(self):
-        for _ in range(6):
-            if on_chat_list(self.adb):
+        for _ in range(8):
+            st = on_chat_list(self.adb)
+            if st:
                 return True
+            if st is None:                # unreadable: retry, don't BACK out of WhatsApp
+                time.sleep(1.0); continue
             self.adb.key("BACK"); time.sleep(1.2)
-        return on_chat_list(self.adb)
+        return bool(on_chat_list(self.adb))
 
     def _swipe_down(self):
         w, h = self.size
         # Scroll strictly inside the MIDDLE band of the screen, centred on h/2, so the gesture
         # never reaches the bottom "home" area (which minimises/closes WhatsApp) or the top bar.
-        # Symmetric around the middle (0.66h -> 0.34h = ~32% of the screen), horizontally centred,
+        # Symmetric around the middle (0.60h -> 0.40h = ~20% of the screen), horizontally centred,
         # with a slow ~600ms stroke so it drags (no fling momentum that would skip chats). Small
         # enough to keep big overlap, large enough to always advance. Uses the live w/h read from
         # the device on connect, so it adapts to any resolution.
         cx = w // 2
-        self.adb.swipe(cx, int(h * 0.66), cx, int(h * 0.34), 600); time.sleep(0.6)
+        self.adb.swipe(cx, int(h * 0.60), cx, int(h * 0.40), 600); time.sleep(0.6)
 
     def _write_csv(self):
         try:
