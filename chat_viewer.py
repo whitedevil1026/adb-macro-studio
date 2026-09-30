@@ -114,8 +114,11 @@ def parse_chat_text(text):
     return msgs
 
 
-def load_zip(path, max_bytes):
-    """Return a chat dict {name, messages, ...} from one export zip, or None if it has no chat."""
+def load_zip(path, max_bytes, mode="embed", media_root=None, idx=0):
+    """Return a chat dict {name, messages, ...} from one export zip, or None if it has no chat.
+    mode="embed": media as base64 data URIs (single-file output).
+    mode="folder": media extracted to <media_root>/<idx>/ and referenced by relative path
+                   (handles ALL media, any size - one index.html + a media/ folder)."""
     try:
         zf = zipfile.ZipFile(path)
     except Exception as e:
@@ -131,6 +134,11 @@ def load_zip(path, max_bytes):
     text = raw.decode("utf-8", "replace")
     msgs = parse_chat_text(text)
 
+    out_dir = None
+    if mode == "folder":
+        out_dir = os.path.join(media_root, str(idx))
+        os.makedirs(out_dir, exist_ok=True)
+
     # index media files in the zip by basename
     files = {os.path.basename(n): n for n in names if not n.lower().endswith(".txt")}
     used, embedded, skipped, embed_bytes = set(), 0, 0, 0
@@ -138,12 +146,25 @@ def load_zip(path, max_bytes):
         media = []
         for ref in mo["media_refs"]:
             inzip = files.get(ref)
-            item = {"name": ref, "kind": _kind(ref), "data": None, "size": 0}
+            item = {"name": ref, "kind": _kind(ref), "data": None, "src": None, "size": 0}
             if inzip is not None:
                 used.add(inzip)
                 info = zf.getinfo(inzip)
                 item["size"] = info.file_size
-                if max_bytes == 0 or info.file_size <= max_bytes:
+                if mode == "folder":
+                    # extract to media/<idx>/<basename> and reference by relative path (ALL media)
+                    dest = os.path.join(out_dir, ref)
+                    if not os.path.exists(dest):
+                        with zf.open(inzip) as src, open(dest, "wb") as dst:
+                            while True:
+                                chunk = src.read(1 << 20)
+                                if not chunk:
+                                    break
+                                dst.write(chunk)
+                    item["src"] = f"media/{idx}/{ref}"
+                    embedded += 1
+                    embed_bytes += info.file_size
+                elif max_bytes == 0 or info.file_size <= max_bytes:
                     b = zf.read(inzip)
                     mime = _MIME.get(os.path.splitext(ref)[1].lower(), "application/octet-stream")
                     item["data"] = f"data:{mime};base64," + base64.b64encode(b).decode("ascii")
@@ -185,17 +206,21 @@ def _sha256(path):
     return h.hexdigest()
 
 
-def build(folder, out_path, max_embed_mb, owner):
+def build(folder, out_path, max_embed_mb, owner, mode="embed"):
     zips = sorted(glob.glob(os.path.join(folder, "*.zip")))
     if not zips:
         print("No .zip files found in:", folder)
         return 1
     max_bytes = int(max_embed_mb * 1024 * 1024)
-    print(f"Building viewer from {len(zips)} zip(s) in {folder}")
+    media_root = None
+    if mode == "folder":
+        media_root = os.path.join(os.path.dirname(os.path.abspath(out_path)), "media")
+        os.makedirs(media_root, exist_ok=True)
+    print(f"Building viewer ({mode} mode) from {len(zips)} zip(s) in {folder}")
     chats = []
-    for z in zips:
+    for i, z in enumerate(zips):
         print(f"- {os.path.basename(z)}")
-        c = load_zip(z, max_bytes)
+        c = load_zip(z, max_bytes, mode=mode, media_root=media_root, idx=i)
         if c:
             chats.append(c)
     if not chats:
@@ -212,8 +237,13 @@ def build(folder, out_path, max_embed_mb, owner):
     total_skip = sum(c["skipped"] for c in chats)
     size = os.path.getsize(out_path)
     print(f"\nWrote {out_path}  ({size/1e6:.1f} MB)")
-    print(f"chats={len(chats)}  media embedded={sum(c['embedded'] for c in chats)} "
-          f"({total_embed/1e6:.1f} MB)  media too-large-skipped={total_skip}")
+    if mode == "folder":
+        print(f"chats={len(chats)}  media extracted={sum(c['embedded'] for c in chats)} "
+              f"({total_embed/1e6:.1f} MB) -> {media_root}")
+        print("Open index.html; keep the media/ folder beside it.")
+    else:
+        print(f"chats={len(chats)}  media embedded={sum(c['embedded'] for c in chats)} "
+              f"({total_embed/1e6:.1f} MB)  media too-large-skipped={total_skip}")
     if size > 800e6:
         print("WARNING: the HTML is very large and may be slow to open. Lower --max-embed-mb.")
     return 0
@@ -342,11 +372,12 @@ function openChat(i, scrollToIdx){
 }
 
 function mediaHtml(m){
-  if(m.data){
-    if(m.kind==='image') return `<img loading="lazy" src="${m.data}">`;
-    if(m.kind==='video') return `<video controls preload="none" src="${m.data}"></video>`;
-    if(m.kind==='audio') return `<audio controls preload="none" src="${m.data}"></audio>`;
-    return `<a class="file" href="${m.data}" download="${esc(m.name)}">📎 ${esc(m.name)}</a>`;
+  const src = m.src || m.data;                 // folder mode uses a relative path, embed mode a data URI
+  if(src){
+    if(m.kind==='image') return `<img loading="lazy" src="${src}">`;
+    if(m.kind==='video') return `<video controls preload="none" src="${src}"></video>`;
+    if(m.kind==='audio') return `<audio controls preload="none" src="${src}"></audio>`;
+    return `<a class="file" href="${src}" download="${esc(m.name)}">📎 ${esc(m.name)}</a>`;
   }
   const kb=(m.size/1024).toFixed(0);
   return `<div class="ph">📎 ${esc(m.name)} — not embedded (${kb} KB, over the size cap)</div>`;
@@ -426,12 +457,17 @@ def main():
     ap = argparse.ArgumentParser(description="Build a self-contained WhatsApp-Web-style HTML viewer from export zips.")
     ap.add_argument("folder", help="folder containing WhatsApp export .zip files")
     ap.add_argument("-o", "--out", default=None, help="output .html (default: <folder>/chat_viewer.html)")
+    ap.add_argument("--media", choices=["embed", "folder"], default="embed",
+                    help="embed: single self-contained .html (media as base64, capped by "
+                         "--max-embed-mb). folder: one index.html + a media/ folder holding ALL "
+                         "media at any size (recommended for a full export set).")
     ap.add_argument("--max-embed-mb", type=float, default=20.0,
-                    help="embed media up to this size each (MB); 0 = embed everything (default 20)")
+                    help="embed mode only: embed media up to this size each (MB); 0 = everything")
     ap.add_argument("--owner", default="", help="your sender name (right-aligned as 'you')")
     args = ap.parse_args()
-    out = args.out or os.path.join(args.folder, "chat_viewer.html")
-    sys.exit(build(args.folder, out, args.max_embed_mb, args.owner))
+    default_name = "index.html" if args.media == "folder" else "chat_viewer.html"
+    out = args.out or os.path.join(args.folder, default_name)
+    sys.exit(build(args.folder, out, args.max_embed_mb, args.owner, mode=args.media))
 
 
 if __name__ == "__main__":

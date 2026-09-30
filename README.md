@@ -272,16 +272,27 @@ in seconds (fast retry) and a **"Sent"** is logged as progress.
 offline HTML page** that reads like WhatsApp Web — a searchable chat list on the left, message
 bubbles with inline images/video/audio on the right, and global + in-chat search.
 
+**For a full export set (all chats + all media), use folder mode** — one `index.html` plus a
+`media/` folder beside it. You open `index.html` and every chat + every image/video/audio is
+there, at any size, nothing skipped:
 ```bash
-python chat_viewer.py "E:\quickshare"
-# -> writes E:\quickshare\chat_viewer.html   (just double-click to open; no internet needed)
+python chat_viewer.py "E:\quickshare" --media folder
+# -> writes E:\quickshare\index.html  +  E:\quickshare\media\   (open index.html; keep media\ beside it)
+```
+
+Or a **single portable file** (good for one/a few smaller chats), media embedded as base64:
+```bash
+python chat_viewer.py "E:\quickshare"          # -> chat_viewer.html (one file)
 ```
 
 Options:
-- `-o viewer.html` — output path (default `<folder>/chat_viewer.html`).
-- `--max-embed-mb N` — embed media up to N MB each (default **20**); larger media shows a labelled
-  placeholder instead of bloating the file. Use `--max-embed-mb 0` to embed **everything**
-  (portable but can be gigabytes for big media).
+- `--media {embed,folder}` — `embed` = one self-contained `.html` (default; media as base64, capped
+  by `--max-embed-mb`). `folder` = `index.html` + a `media/` folder holding **all** media at any
+  size (recommended for a whole export set). A truly single file with *all* media can be many GB and
+  won't open — that's why big sets use folder mode.
+- `-o path.html` — output path.
+- `--max-embed-mb N` — embed mode only: embed media up to N MB each (default **20**); larger shows a
+  labelled placeholder. `0` = embed everything.
 - `--owner "Your Name"` — right-align your own messages as "you" (auto-detected otherwise; WhatsApp
   writes the owner's own messages as "You").
 
