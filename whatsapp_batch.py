@@ -861,6 +861,7 @@ class RollingBatch(threading.Thread):
                         self._write_csv()
                         continue
                     # whole page done -> scroll for more
+                    before_swipe = visible
                     self._swipe_down()
                     after = [nm for _, nm in visible_chats(self.adb)]
                     if not after:                      # empty read = screen-reader error, NOT the bottom
@@ -870,13 +871,21 @@ class RollingBatch(threading.Thread):
                             break
                         continue
                     empty_reads = 0
-                    if not any(nm not in self.status for nm in after):
+                    if any(nm not in self.status for nm in after):
+                        stale = 0                      # found new chats -> keep going
+                    elif after == before_swipe:
+                        # the swipe did NOT move the list at all -> genuinely the bottom
                         stale += 1
-                        if stale >= 2:                 # nothing new twice = bottom
+                        if stale >= 2:
                             self.emit("log", "reached the bottom of the chat list")
                             break
                     else:
-                        stale = 0
+                        # list moved but revealed nothing new (all already seen) - a gentle swipe
+                        # can do this near the end; nudge a few more times before concluding bottom
+                        stale += 1
+                        if stale >= 5:
+                            self.emit("log", "reached the bottom of the chat list")
+                            break
                 except core.AdbError as e:
                     self.emit("log", f"adb error (likely disconnect): {e}")
                     self._wait_device()
