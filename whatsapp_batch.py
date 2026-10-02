@@ -94,17 +94,31 @@ def _nodes(adb):
         return []
 
 
+# direction / formatting marks WhatsApp sprinkles into names; strip so the SAME chat always reads
+# as the SAME name (otherwise a misread with a stray mark looks like a new/phantom chat).
+_NAME_MARKS = "‎‏‪‫‬⁦⁧⁨⁩﻿"
+
+
+def _norm_name(s):
+    return (s or "").strip().strip(_NAME_MARKS).strip()
+
+
 def visible_chats(adb):
-    """List of (y, name) for chat rows currently on screen, top -> bottom."""
-    rows = [(n["bounds"][1], n["text"]) for n in _nodes(adb)
-            if n["id"].endswith(CONTACT_ID) and n["text"].strip()]
+    """List of (y, name) for chat rows currently on screen, top -> bottom. Names are normalised
+    (whitespace + invisible direction marks stripped) for stable de-duplication."""
+    rows = []
+    for n in _nodes(adb):
+        if n["id"].endswith(CONTACT_ID):
+            nm = _norm_name(n["text"])
+            if nm:
+                rows.append((n["bounds"][1], nm))
     return sorted(rows)
 
 
 def _find_chat_node(adb, name):
-    key = name.strip().lower()
+    key = _norm_name(name).lower()
     for n in _nodes(adb):
-        if n["id"].endswith(CONTACT_ID) and n["text"].strip().lower() == key:
+        if n["id"].endswith(CONTACT_ID) and _norm_name(n["text"]).lower() == key:
             return n
     return None
 
@@ -147,24 +161,31 @@ def wake_unlock(adb):
 
 
 # ----------------------------------------------------------------- scan
-def scan_chats(adb, size, emit=None, max_scrolls=60, pause=None, stop=None):
+def scan_chats(adb, size, emit=None, max_scrolls=500, pause=None, stop=None):
     """Scroll from the top and return the ordered list of chat names.
+    Uses a gentle, momentum-free swipe (no fling -> no skipped names) and treats the bottom as
+    'the list stopped moving' (not 'no new names', which fires early on long lists).
     Pausable via `pause` (set = paused) and stoppable via `stop` (threading.Events)."""
     w, h = size
+    cx, cy = w // 2, h // 2
+    off = int(h * 0.06)                   # same tiny swing as the export scroll (no fling)
+
     def _wait_pause():
         while pause is not None and pause.is_set():
             if stop is not None and stop.is_set():
                 return
             time.sleep(0.2)
-    def swipe_up():                       # toward the top (big, fast)
-        adb.swipe(w // 2, int(h * 0.28), w // 2, int(h * 0.82), 220); time.sleep(0.3)
-    def swipe_down():
-        adb.swipe(w // 2, int(h * 0.78), w // 2, int(h * 0.33), 220); time.sleep(0.32)
+
+    def swipe_up():                       # gentle, toward the top
+        adb.swipe(cx, cy - off, cx, cy + off, 2200); time.sleep(1.0)
+
+    def swipe_down():                     # gentle, toward the bottom
+        adb.swipe(cx, cy + off, cx, cy - off, 2200); time.sleep(1.0)
 
     keep_awake(adb, True)
-    # jump to the top first
+    # jump to the top first (stop when the view stops changing)
     last = None
-    for _ in range(10):
+    for _ in range(40):
         if stop and stop.is_set():
             return []
         _wait_pause()
@@ -174,21 +195,25 @@ def scan_chats(adb, size, emit=None, max_scrolls=60, pause=None, stop=None):
         last = cur; swipe_up()
 
     ordered, seen = [], set()
-    stable = 0
+    stale = 0
     for _ in range(max_scrolls):
         if stop and stop.is_set():
             break
         _wait_pause()
-        added = 0
-        for _, nm in visible_chats(adb):
+        before = [nm for _, nm in visible_chats(adb)]
+        for nm in before:
             if nm not in seen:
-                seen.add(nm); ordered.append(nm); added += 1
+                seen.add(nm); ordered.append(nm)
         if emit:
             emit("scan_progress", len(ordered))
-        stable = stable + 1 if added == 0 else 0
-        if stable >= 2:                      # bottom reached (no new names twice)
-            break
         swipe_down()
+        after = [nm for _, nm in visible_chats(adb)]
+        if after and after == before:        # the list did not move -> bottom reached
+            stale += 1
+            if stale >= 3:
+                break
+        else:
+            stale = 0
     return ordered
 
 
@@ -357,20 +382,27 @@ def _do_export(adb, media, emit_log, outer_stop, left):
     return "stopped" if _stopped() else ("timeout" if left() <= 0 else "fail")
 
 
-def _back_to_list(adb, tries=8):
+def _back_to_list(adb, tries=10):
+    """Get back to the chat list after an export. We are NOT on the list here (we're on a share
+    sheet / dialog / inside a chat), so a BACK is safe and needed - including on an UNREADABLE
+    frame, which is usually a stuck dialog, not the list. We give the first couple of unreadable
+    frames a moment to settle, then press BACK regardless. This avoids the relaunch fallback
+    (which resets the list scroll to the top and makes long runs re-traverse / stop early)."""
+    none_streak = 0
     for _ in range(tries):
         st = on_chat_list(adb)
         if st:
             return True
-        if st is None:                    # unreadable screen: retry the read, never BACK blindly
-            time.sleep(1.0); continue
+        if st is None and none_streak < 2:
+            none_streak += 1; time.sleep(1.0); continue   # let a transient frame settle
+        none_streak = 0
         adb.key("BACK"); time.sleep(1.2)
-    # last resort: bring WhatsApp back to the front
+    # last resort: bring WhatsApp back to the front (NOTE: this resets the list scroll)
     try:
         adb.launch("com.whatsapp"); time.sleep(2.0)
     except core.AdbError:
         pass
-    for _ in range(4):
+    for _ in range(5):
         st = on_chat_list(adb)
         if st:
             return True
@@ -592,13 +624,17 @@ class WhatsAppBatch(threading.Thread):
 
     def _swipe_down(self):
         w, h = self.size
-        self.adb.swipe(w // 2, int(h * 0.72), w // 2, int(h * 0.34), 400); time.sleep(0.8)
+        cx, cy = w // 2, h // 2
+        off = int(h * 0.06)                    # gentle, no-fling drag (consistent with the rest)
+        self.adb.swipe(cx, cy + off, cx, cy - off, 2200); time.sleep(1.0)
 
     def _swipe_up(self):
         w, h = self.size
-        self.adb.swipe(w // 2, int(h * 0.34), w // 2, int(h * 0.72), 400); time.sleep(0.8)
+        cx, cy = w // 2, h // 2
+        off = int(h * 0.06)
+        self.adb.swipe(cx, cy - off, cx, cy + off, 2200); time.sleep(1.0)
 
-    def _scroll_to(self, name, max_steps=45):
+    def _scroll_to(self, name, max_steps=120):
         """Scroll toward `name` using the known order; recover from overshoot."""
         ti = self.order.index(name) if name in self.order else None
         for _ in range(max_steps):
@@ -931,6 +967,7 @@ class RollingBatch(threading.Thread):
             self.emit("log", f"rolling export started - CSV: {self.csv_path}")
             stale = 0
             empty_reads = 0
+            no_new = 0            # consecutive swipes that moved but revealed nothing new
             while not self._stop.is_set():
                 self._wait_pause()
                 if self._stop.is_set():
@@ -983,19 +1020,21 @@ class RollingBatch(threading.Thread):
                         continue
                     empty_reads = 0
                     if any(nm not in self.status for nm in after):
-                        stale = 0                      # found new chats -> keep going
+                        stale = 0; no_new = 0          # found new chats -> keep going
                     elif after == before_swipe:
-                        # the swipe did NOT move the list at all -> genuinely the bottom
+                        # the list did NOT move at all -> genuinely the bottom (only reliable signal)
                         stale += 1
-                        if stale >= 2:
+                        if stale >= 3:
                             self.emit("log", "reached the bottom of the chat list")
                             break
                     else:
-                        # list moved but revealed nothing new (all already seen) - a gentle swipe
-                        # can do this near the end; nudge a few more times before concluding bottom
-                        stale += 1
-                        if stale >= 5:
-                            self.emit("log", "reached the bottom of the chat list")
+                        # list MOVED but revealed nothing new: we're re-traversing already-seen
+                        # chats (e.g. the list jumped to the top after a relaunch). This is NOT the
+                        # bottom - keep scrolling. Only an extremely long dry spell is a safety stop.
+                        stale = 0
+                        no_new += 1
+                        if no_new >= 150:
+                            self.emit("log", "no new chats after 150 scrolls - stopping (safety)")
                             break
                 except core.AdbError as e:
                     self.emit("log", f"adb error (likely disconnect): {e}")
