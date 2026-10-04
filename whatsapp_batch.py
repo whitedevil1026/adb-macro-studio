@@ -315,6 +315,20 @@ def _wait_either(adb, text_a, text_b, timeout=60, match="contains", stop=None):
     return None
 
 
+def _wait_any(adb, labels, timeout=60, match="contains", stop=None):
+    """labels: {key: text}. Return the key of the first text to appear on screen, or None."""
+    end = time.time() + timeout
+    while time.time() < end:
+        if stop is not None and stop.is_set():
+            return None
+        nodes = _nodes(adb)
+        for key, txt in labels.items():
+            if core.find_node(nodes, txt, match):
+                return key
+        time.sleep(0.6)
+    return None
+
+
 def _open_export_menu(adb, stop=None, left=lambda: 1e9):
     """Reliably navigate the chat overflow menu to reveal "Export chat".
 
@@ -365,10 +379,26 @@ def _do_export(adb, media, emit_log, outer_stop, left):
             return False
         return _tap_text(adb, "Export chat", timeout=12, match="contains", delay=1.2, stop=outer_stop)
 
+    def _is_privacy_blocked():
+        # newer WhatsApp: "Advanced chat privacy" blocks export -> a "Can't export chats" dialog
+        n = _nodes(adb)
+        return (core.find_node(n, "Can't export", "contains") is not None
+                or core.find_node(n, "Advanced chat privacy", "contains") is not None)
+
+    def _skip_blocked():
+        emit_log("Advanced Chat Privacy is ON for this chat - cannot export; skipping")
+        _tap_text(adb, "OK", timeout=6, match="exact", delay=0.6, stop=outer_stop)
+        return "blocked"
+
     # --- attempt WITH media ---
     media["mode"] = "with media"
     if not _open_and_tap_export():
         return "stopped" if _stopped() else ("timeout" if left() <= 0 else "fail")
+    # Some chats have "Advanced chat privacy" ON, which BLOCKS export: a "Can't export chats"
+    # dialog shows instead of the media choice. Detect it right away so we don't hang for minutes
+    # waiting for a share sheet that will never appear.
+    if _wait_text(adb, "Can't export", timeout=4, match="contains", stop=outer_stop) or _is_privacy_blocked():
+        return _skip_blocked()
     # WAIT for the media-choice dialog to appear after "Export chat", THEN tap "Include media".
     # (Don't assume it's instant - tapping too early / bailing early was leaving the export stuck.)
     if _wait_text(adb, "Include media", timeout=15, match="contains", stop=outer_stop):
@@ -378,11 +408,14 @@ def _do_export(adb, media, emit_log, outer_stop, left):
             if core.find_node(_nodes(adb), "Include media", "contains") is None:
                 break                                   # tapped -> dialog gone, export proceeding
             _tap_text(adb, "Include media", timeout=8, match="contains", delay=1.2, stop=outer_stop)
-    # branch: "Unable to export" (too big) -> fall back; else the Quick Share sheet appears
-    which = _wait_either(adb, "Unable to export", "Quick Share",
-                         timeout=max(5, min(300, left())), stop=outer_stop)
-    if which == "b":
+    # branch: privacy-blocked | media-too-big | Quick Share sheet
+    which = _wait_any(adb, {"blocked": "Can't export", "unable": "Unable to export",
+                            "qs": "Quick Share"},
+                      timeout=max(5, min(300, left())), stop=outer_stop)
+    if which == "qs":
         return "done"                                   # with media reached Quick Share
+    if which == "blocked":
+        return _skip_blocked()
     if which is None:
         return "stopped" if _stopped() else ("timeout" if left() <= 0 else "fail")
 
@@ -457,6 +490,10 @@ def export_and_send(adb, case, size, emit_log=lambda m: None, outer_stop=None,
     if reason == "timeout":
         emit_log("took too long to export - skipping (fail-timeout)")
         _back_to_list(adb); return "fail-timeout", None, None, media["mode"]
+    if reason == "blocked":
+        # "Advanced chat privacy" is ON for this chat - export is impossible until the user turns
+        # it off, so don't retry; record it distinctly and move on.
+        _back_to_list(adb); return "blocked", None, None, media["mode"]
     if reason != "done":
         _back_to_list(adb)
         return "fail-export", None, None, media["mode"]
