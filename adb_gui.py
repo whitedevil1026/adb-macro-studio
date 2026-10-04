@@ -322,7 +322,8 @@ class SequenceDialog(tk.Toplevel):
 class BatchExportWindow(tk.Toplevel):
     """Scan the WhatsApp chat list, pick chats, export them one by one with live progress."""
 
-    STATUS_TAGS = {"ok": "#0a0", "running": "#06c", "pending": "#888"}
+    STATUS_TAGS = {"ok": "#0a0", "running": "#06c", "pending": "#888",
+                   "skipped": "#888", "blocked-privacy": "#c80"}
 
     def __init__(self, app):
         super().__init__(app.root)

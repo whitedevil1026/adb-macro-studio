@@ -492,8 +492,8 @@ def export_and_send(adb, case, size, emit_log=lambda m: None, outer_stop=None,
         _back_to_list(adb); return "fail-timeout", None, None, media["mode"]
     if reason == "blocked":
         # "Advanced chat privacy" is ON for this chat - export is impossible until the user turns
-        # it off, so don't retry; record it distinctly and move on.
-        _back_to_list(adb); return "blocked", None, None, media["mode"]
+        # it off, so don't retry; record the REASON clearly in the CSV and move on.
+        _back_to_list(adb); return "blocked-privacy", None, None, media["mode"]
     if reason != "done":
         _back_to_list(adb)
         return "fail-export", None, None, media["mode"]

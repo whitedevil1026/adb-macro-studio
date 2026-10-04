@@ -273,7 +273,9 @@ it's always current — even mid-run and even for failures. Columns:
 | `sha256` | Hash of the received file |
 | `time` | When **that** chat finished (frozen per row, not the last-write time) |
 
-Common `status` values: `ok`, `fail-export` (couldn't produce the file), `fail-timeout` (over the
+Common `status` values: `ok`, `blocked-privacy` (the chat has WhatsApp's **Advanced Chat Privacy**
+on, which blocks export - skipped, not an error; turn it off on that chat and re-run via Resume),
+`fail-export` (couldn't produce the file), `fail-timeout` (over the
 per-chat budget), `fail-sent` (the phone's Quick Share showed **"Failed"** - the transfer dropped,
 usually Bluetooth/Wi-Fi), `fail-transfer` (the file never arrived within the timeout - PC not
 receiving, asleep, or wrong save folder), `fail-noshare`/`fail-pcpick` (couldn't find Quick Share
