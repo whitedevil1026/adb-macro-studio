@@ -170,6 +170,23 @@ def screen_is_on(adb):
     return None
 
 
+def on_share_sheet(adb):
+    """True if the Android system share sheet (chooser) is the foreground window. This is the
+    RELIABLE way to know the export reached the share sheet, because `uiautomator dump` often
+    returns NOTHING for the chooser (com.android.intentresolver / ChooserActivity), so the text
+    'Quick Share' can't be read even though it's on screen."""
+    try:
+        out = adb.shell("dumpsys", "window", quiet=True)
+    except Exception:
+        return False
+    for line in out.splitlines():
+        if "mCurrentFocus" in line or "mFocusedApp" in line:
+            if ("intentresolver" in line or "ChooserActivity" in line
+                    or "ResolverActivity" in line or "com.android.internal.app.ChooserActivity" in line):
+                return True
+    return False
+
+
 def wake_unlock(adb, size=None):
     """Wake the screen and swipe up to dismiss a SIMPLE (swipe) keyguard. Cannot defeat a secure
     PIN/pattern/password lock - for those the caller must ask the user to unlock the phone."""
@@ -329,6 +346,29 @@ def _wait_any(adb, labels, timeout=60, match="contains", stop=None):
     return None
 
 
+def _wait_export_outcome(adb, timeout, stop=None):
+    """After tapping Include/Without media, wait for the export outcome and return one of:
+    'blocked' (Advanced chat privacy), 'unable' (media too big -> fall back), 'qs' (the share
+    sheet was reached), or None (timeout/stopped). 'qs' is detected by the "Quick Share" text
+    OR by the Android chooser being the foreground window - the chooser is frequently UNREADABLE
+    by uiautomator, so waiting only for the text would hang forever."""
+    end = time.time() + timeout
+    while time.time() < end:
+        if stop is not None and stop.is_set():
+            return None
+        nodes = _nodes(adb)
+        if core.find_node(nodes, "Can't export", "contains"):
+            return "blocked"
+        if core.find_node(nodes, "Unable to export", "contains"):
+            return "unable"
+        if core.find_node(nodes, "Quick Share", "contains"):
+            return "qs"
+        if on_share_sheet(adb):            # chooser up but unreadable -> export reached the share sheet
+            return "qs"
+        time.sleep(0.7)
+    return None
+
+
 def _open_export_menu(adb, stop=None, left=lambda: 1e9):
     """Reliably navigate the chat overflow menu to reveal "Export chat".
 
@@ -408,12 +448,10 @@ def _do_export(adb, media, emit_log, outer_stop, left):
             if core.find_node(_nodes(adb), "Include media", "contains") is None:
                 break                                   # tapped -> dialog gone, export proceeding
             _tap_text(adb, "Include media", timeout=8, match="contains", delay=1.2, stop=outer_stop)
-    # branch: privacy-blocked | media-too-big | Quick Share sheet
-    which = _wait_any(adb, {"blocked": "Can't export", "unable": "Unable to export",
-                            "qs": "Quick Share"},
-                      timeout=max(5, min(300, left())), stop=outer_stop)
+    # branch: privacy-blocked | media-too-big | share sheet reached (by text OR foreground chooser)
+    which = _wait_export_outcome(adb, timeout=max(5, min(300, left())), stop=outer_stop)
     if which == "qs":
-        return "done"                                   # with media reached Quick Share
+        return "done"                                   # with media reached the share sheet
     if which == "blocked":
         return _skip_blocked()
     if which is None:
@@ -432,7 +470,8 @@ def _do_export(adb, media, emit_log, outer_stop, left):
             if core.find_node(_nodes(adb), "Without media", "contains") is None:
                 break
             _tap_text(adb, "Without media", timeout=8, match="contains", delay=1.2, stop=outer_stop)
-    if _wait_text(adb, "Quick Share", timeout=max(5, min(240, left())), stop=outer_stop):
+    # share sheet reached? (text OR the foreground chooser, since the chooser is often unreadable)
+    if _wait_export_outcome(adb, timeout=max(5, min(240, left())), stop=outer_stop) == "qs":
         return "done"
     return "stopped" if _stopped() else ("timeout" if left() <= 0 else "fail")
 
@@ -501,9 +540,15 @@ def export_and_send(adb, case, size, emit_log=lambda m: None, outer_stop=None,
     cached = _COORDS.get(key, {})
     blind = False                              # did we fall back to a learned position?
 
-    # --- find & tap "Quick Share" (via screen-reader, else the learned position) ---
-    qs_node = _wait_node(adb, "Quick Share",
-                         max(2, min(40 if cached.get("qs") else 240, _left())), stop=outer_stop)
+    # --- find & tap "Quick Share" ---
+    # The Android share chooser is frequently UNREADABLE by uiautomator (0 nodes). So: if the
+    # chooser is the foreground window, don't waste time waiting for a "Quick Share" node that can
+    # never be read - go straight to the learned position. Only try reading it when the chooser
+    # isn't (yet) the recognised foreground.
+    qs_node = None
+    if not on_share_sheet(adb):
+        qs_node = _wait_node(adb, "Quick Share",
+                             max(2, min(40 if cached.get("qs") else 240, _left())), stop=outer_stop)
     before = bt.snapshot(save_dir)
     if auto_accept and qs_accept is not None:
         threading.Thread(target=lambda: qs_accept.accept_quickshare(timeout=180, log=emit_log),
@@ -512,7 +557,7 @@ def export_and_send(adb, case, size, emit_log=lambda m: None, outer_stop=None,
         _COORDS.setdefault(key, {})["qs"] = list(core.node_center(qs_node)); _save_coords()
         adb.tap(*core.node_center(qs_node)); time.sleep(3.0)
     elif cached.get("qs"):
-        emit_log("phone too busy to read the screen - tapping Quick Share by learned position")
+        emit_log("share sheet unreadable - tapping Quick Share by learned position")
         adb.tap(*cached["qs"]); time.sleep(3.0); blind = True
     else:
         _back_to_list(adb)
@@ -1080,6 +1125,13 @@ class RollingBatch(threading.Thread):
                 if loops % 15 == 0:
                     keep_awake(self.adb, True)       # periodically re-assert (stay-on can lapse)
                 try:
+                    # a mega-chat's export can finish LATE and pop the Android share sheet after we
+                    # already moved on; it's unreadable so visible_chats can't see it. Detect the
+                    # chooser by its foreground window and BACK out of it before doing anything.
+                    for _ in range(4):
+                        if not on_share_sheet(self.adb):
+                            break
+                        self.adb.key("BACK"); time.sleep(1.0)
                     visible = [nm for _, nm in visible_chats(self.adb)]
                     if not visible:
                         # unreadable at the top of the loop -> often a LOCKED / screen-OFF phone.
