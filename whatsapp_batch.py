@@ -177,10 +177,10 @@ def scan_chats(adb, size, emit=None, max_scrolls=500, pause=None, stop=None):
             time.sleep(0.2)
 
     def swipe_up():                       # gentle, toward the top
-        adb.swipe(cx, cy - off, cx, cy + off, 2200); time.sleep(1.0)
+        adb.swipe(cx, cy - off, cx, cy + off, 1200); time.sleep(0.7)
 
     def swipe_down():                     # gentle, toward the bottom
-        adb.swipe(cx, cy + off, cx, cy - off, 2200); time.sleep(1.0)
+        adb.swipe(cx, cy + off, cx, cy - off, 1200); time.sleep(0.7)
 
     keep_awake(adb, True)
     # jump to the top first (stop when the view stops changing)
@@ -626,13 +626,13 @@ class WhatsAppBatch(threading.Thread):
         w, h = self.size
         cx, cy = w // 2, h // 2
         off = int(h * 0.06)                    # gentle, no-fling drag (consistent with the rest)
-        self.adb.swipe(cx, cy + off, cx, cy - off, 2200); time.sleep(1.0)
+        self.adb.swipe(cx, cy + off, cx, cy - off, 1200); time.sleep(0.7)
 
     def _swipe_up(self):
         w, h = self.size
         cx, cy = w // 2, h // 2
         off = int(h * 0.06)
-        self.adb.swipe(cx, cy - off, cx, cy + off, 2200); time.sleep(1.0)
+        self.adb.swipe(cx, cy - off, cx, cy + off, 1200); time.sleep(0.7)
 
     def _scroll_to(self, name, max_steps=120):
         """Scroll toward `name` using the known order; recover from overshoot."""
@@ -853,15 +853,15 @@ class RollingBatch(threading.Thread):
         cx, cy = w // 2, h // 2                # exact centre point
         # Tiny swing over a VERY slow stroke so the release velocity is far below Android's fling
         # threshold -> the list moves exactly the drag distance with NO momentum/overshoot, so no
-        # chat is flung past unread. (0.06h over 2200ms ~= 85 px/s on a 3120px screen.)
+        # chat is flung past unread. (0.06h over 1200ms: measured ratio ~1.0 = no overshoot.)
         off = int(h * 0.06)
-        self.adb.swipe(cx, cy + off, cx, cy - off, 2200); time.sleep(1.0)
+        self.adb.swipe(cx, cy + off, cx, cy - off, 1200); time.sleep(0.7)
 
     def _swipe_up(self):
         w, h = self.size
         cx, cy = w // 2, h // 2
         off = int(h * 0.06)
-        self.adb.swipe(cx, cy - off, cx, cy + off, 2200); time.sleep(1.0)
+        self.adb.swipe(cx, cy - off, cx, cy + off, 1200); time.sleep(0.7)
 
     def _seek_chat(self, target, max_scrolls=120):
         """Scroll from the top until `target` is on screen; mark every chat passed on the way as
