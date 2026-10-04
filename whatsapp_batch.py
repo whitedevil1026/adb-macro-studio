@@ -907,6 +907,7 @@ class RollingBatch(threading.Thread):
         self.resume_from = resume_from   # path to a prior CSV: skip its 'ok' chats, retry the rest
         self.start_from = start_from     # chat name to scroll to and begin at (skip everything above)
         self.only_names = None           # if set (a set of names), export ONLY these; skip others
+        self.scan_order = None           # a pre-scanned ordered list of names (for directional seek)
 
     def stop(self):
         self._stop.set()
@@ -1000,35 +1001,69 @@ class RollingBatch(threading.Thread):
         off = int(h * 0.06)
         self.adb.swipe(cx, cy - off, cx, cy + off, 1200); time.sleep(0.7)
 
-    def _seek_chat(self, target, max_scrolls=120):
-        """Scroll from the top until `target` is on screen; mark every chat passed on the way as
-        'skipped' (we're deliberately starting later). Returns True if found."""
-        tgt = (target or "").strip().lower()
-        # jump to the very top first so "start from here" is deterministic
-        for _ in range(30):
-            if self._stop.is_set():
-                return False
-            before = [nm for _, nm in visible_chats(self.adb)]
-            self._swipe_up()
-            after = [nm for _, nm in visible_chats(self.adb)]
-            if after and after == before:
-                break                          # at the top
+    def _seek_chat(self, target, max_scrolls=200):
+        """Navigate to `target` and begin there. If a pre-scanned order is known, use it to decide
+        DIRECTION (the target's index vs the chats currently on screen) and scroll up or down
+        accordingly - much faster than always scrolling from the top. Every chat that comes BEFORE
+        the target in the scan order is marked 'skipped' (we're deliberately starting later).
+        Falls back to a top-down scan if no scan order is available. Returns True if found."""
+        tgt = _norm_name(target).lower()
+        order = [_norm_name(n) for n in (self.scan_order or [])]
+        idx = {nm.lower(): i for i, nm in enumerate(order)}
+        ti = idx.get(tgt)
+
+        def _skip_before():
+            # mark every chat that is before the target in the scan order as 'skipped'
+            if ti is None:
+                return
+            for i in range(ti):
+                orig = (self.scan_order or [])[i]
+                if orig not in self.status:
+                    self.status[orig] = "skipped"; self.order.append(orig)
+                    self.emit("discover", orig); self.emit("row", orig, "skipped")
+            self._write_csv()
+
+        if ti is None:
+            # no known position -> jump to the top, then scan down (old behaviour)
+            for _ in range(30):
+                if self._stop.is_set():
+                    return False
+                before = [nm for _, nm in visible_chats(self.adb)]
+                self._swipe_up()
+                after = [nm for _, nm in visible_chats(self.adb)]
+                if after and after == before:
+                    break
+
         for _ in range(max_scrolls):
             if self._stop.is_set():
                 return False
-            visible = [nm for _, nm in visible_chats(self.adb)]
-            if any(nm.strip().lower() == tgt for nm in visible):
+            vis = [_norm_name(nm) for _, nm in visible_chats(self.adb)]
+            vis_l = [nm.lower() for nm in vis]
+            if tgt in vis_l:
+                _skip_before()
                 return True
-            for nm in visible:                 # everything above the target is intentionally skipped
-                if nm not in self.status:
-                    self.status[nm] = "skipped"; self.order.append(nm)
-                    self.emit("discover", nm); self.emit("row", nm, "skipped")
-            self._write_csv()
-            before = visible
-            self._swipe_down()
-            after = [nm for _, nm in visible_chats(self.adb)]
-            if after and after == before:      # reached the bottom without finding it
-                return False
+            if ti is None:
+                # unknown target position: scan downward, skipping what we pass
+                for nm in vis:
+                    if nm not in self.status:
+                        self.status[nm] = "skipped"; self.order.append(nm)
+                        self.emit("discover", nm); self.emit("row", nm, "skipped")
+                self._write_csv()
+                before = vis_l; self._swipe_down()
+                after = [_norm_name(nm).lower() for _, nm in visible_chats(self.adb)]
+                if after and after == before:
+                    return False
+                continue
+            # directional: compare the target's index to what's on screen
+            vis_idx = [idx[nm] for nm in vis_l if nm in idx]
+            if not vis_idx:
+                self._swipe_down(); continue
+            if max(vis_idx) < ti:
+                self._swipe_down()             # target is below the current view
+            elif min(vis_idx) > ti:
+                self._swipe_up()               # target is above the current view
+            else:
+                self._swipe_down()             # target is within range but just off-screen
         return False
 
     def _write_csv(self):
@@ -1096,9 +1131,12 @@ class RollingBatch(threading.Thread):
                 done = sum(1 for nm in od if self.status.get(nm) == "ok")
                 self.emit("log", f"resume: {len(od)} chats loaded, {done} already ok (skipping "
                                  f"those, retrying the rest)")
+                if not self.scan_order:          # the prior run's order IS the scan list for seeking
+                    self.scan_order = list(od)
                 self._write_csv()
 
-            # START-FROM: scroll to a named chat and begin there (mark everything above as skipped).
+            # START-FROM: go (directionally, using the known scan order) to a named chat and begin
+            # there - everything before it in the order is marked 'skipped'.
             if self.start_from:
                 self.emit("log", f"seeking start chat: {self.start_from}")
                 if self._seek_chat(self.start_from):

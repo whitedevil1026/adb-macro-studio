@@ -363,6 +363,7 @@ class BatchExportWindow(tk.Toplevel):
         ttk.Label(cfg2, text="Start from chat:").pack(side="left")
         self.startfrom_var = tk.StringVar(value="")
         ttk.Entry(cfg2, textvariable=self.startfrom_var, width=20).pack(side="left", padx=4)
+        ttk.Button(cfg2, text="Start from selected", command=self.start_from_selected).pack(side="left", padx=(4, 0))
         self.resume_path = None
         ttk.Button(cfg2, text="Resume from CSV...", command=self._pick_resume).pack(side="left", padx=(12, 0))
         self.resume_lbl = ttk.Label(cfg2, text="(off)", foreground="#8a8")
@@ -498,6 +499,10 @@ class BatchExportWindow(tk.Toplevel):
             return
         if not self.app.case:
             self.app.case = CaseLog(CASE_DIR, self.app.serial or "unknown")
+        # capture the scan state (order + selection) BEFORE clearing the tree
+        scan_order = [self.tree.item(iid, "values")[0] for iid in self.tree.get_children()]
+        sel_names = {self.tree.item(iid, "values")[0] for iid in self.tree.selection()}
+        startf = self.startfrom_var.get().strip() or None
         self.tree.delete(*self.tree.get_children())
         self.row_of.clear()
         self.order = []
@@ -506,22 +511,33 @@ class BatchExportWindow(tk.Toplevel):
         if getattr(self.app, "_live_pause", None):
             self.app._live_pause.set()
         self.start_btn.config(state="disabled")
-        # if chats are selected in the list (after a Scan), export ONLY those; else export all
-        sel = self.tree.selection()
-        only = {self.tree.item(iid, "values")[0] for iid in sel} if sel else None
         self.batch = wb.RollingBatch(self.app.adb, self.app.case, self.app.cur_size,
                                      self._emit, pause=self.pause_evt,
                                      pc_name=self.pc_var.get().strip() or wb.PC_NAME,
                                      save_dir=self.dir_var.get().strip() or wb.SAVE_DIR,
                                      resume_from=self.resume_path,
-                                     start_from=self.startfrom_var.get().strip() or None)
-        if only:
-            self.batch.only_names = only
-            self._log(f"AUTO: exporting ONLY the {len(only)} selected chat(s)")
+                                     start_from=startf)
+        self.batch.scan_order = scan_order or None     # lets start-from go directionally (up/down)
+        # start-from takes precedence; otherwise a selection means "export only these"
+        if startf:
+            self._log(f"AUTO: starting from '{startf}' (scrolling to it, exporting from there down)")
+        elif sel_names:
+            self.batch.only_names = sel_names
+            self._log(f"AUTO: exporting ONLY the {len(sel_names)} selected chat(s)")
         else:
             self._log("AUTO scan + export starting (page by page)")
         self._log(f"CSV file: {self.batch.csv_path}")
         self.batch.start()
+
+    def start_from_selected(self):
+        """Take the chat selected in the list and run Auto starting from it (directional scroll)."""
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showinfo("Select a chat", "Scan first, then select the chat to start from.",
+                                parent=self)
+            return
+        self.startfrom_var.set(self.tree.item(sel[0], "values")[0])
+        self.rolling_start()
 
     def save_csv(self):
         rows = [(self.tree.item(iid, "values")[0], self.tree.item(iid, "values")[1])
