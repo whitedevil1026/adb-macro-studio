@@ -141,21 +141,43 @@ def on_chat_list(adb):
 
 
 def keep_awake(adb, on=True):
-    """Keep the screen on while plugged in (prevents lock/sleep mid-run)."""
+    """Prevent the screen from locking/sleeping mid-run. `svc power stayon` only holds while the
+    device thinks it's charging and resets whenever USB briefly drops, so we ALSO push the
+    screen-off timeout way up as a belt-and-braces measure."""
     try:
         adb.shell("svc", "power", "stayon", "true" if on else "false", quiet=True)
     except Exception:
         pass
-
-
-def wake_unlock(adb):
-    """Best-effort: wake the screen and swipe up if it went to a simple lock."""
     try:
-        adb.key("WAKEUP")
-        time.sleep(0.4)
-        w, h = 720, 1600
-        adb.swipe(w, int(h * 1.4), w, int(h * 0.4), 250)   # swipe up on keyguard
-        time.sleep(0.4)
+        if on:
+            adb.shell("settings", "put", "system", "screen_off_timeout", "1800000", quiet=True)  # 30 min
+    except Exception:
+        pass
+
+
+def screen_is_on(adb):
+    """Best-effort display state: True = on, False = off, None = unknown."""
+    try:
+        out = adb.shell("dumpsys", "power", quiet=True)
+    except Exception:
+        return None
+    for k in ("Display Power: state=ON", "mWakefulness=Awake", "mScreenOn=true"):
+        if k in out:
+            return True
+    for k in ("Display Power: state=OFF", "mWakefulness=Asleep", "mWakefulness=Dozing", "mScreenOn=false"):
+        if k in out:
+            return False
+    return None
+
+
+def wake_unlock(adb, size=None):
+    """Wake the screen and swipe up to dismiss a SIMPLE (swipe) keyguard. Cannot defeat a secure
+    PIN/pattern/password lock - for those the caller must ask the user to unlock the phone."""
+    try:
+        adb.key("WAKEUP"); time.sleep(0.5)
+        w, h = size or (720, 1600)
+        adb.swipe(w // 2, int(h * 0.85), w // 2, int(h * 0.22), 300)   # swipe up on the keyguard
+        time.sleep(0.5)
     except Exception:
         pass
 
@@ -523,7 +545,13 @@ def export_with_retry(adb, case, size, reopen, emit_log, outer_stop, on_runner,
     status, path, digest, media = "fail-notfound", None, None, ""
     for attempt in range(1 + SHARE_RETRIES):
         if not reopen():
-            return "fail-notfound", None, None, ""
+            if attempt == 0:
+                return "fail-notfound", None, None, ""    # genuinely not on screen to begin with
+            # couldn't re-find the chat for the retry (the list moved) - keep the REAL failure from
+            # the previous attempt rather than masking it as 'fail-notfound' (which hides a real
+            # chat and stops it being retried on resume).
+            emit_log("could not re-open the chat for retry - keeping the previous result")
+            return status, path, digest, media
         status, path, digest, media = export_and_send(
             adb, case, size, emit_log=emit_log, outer_stop=outer_stop, on_runner=on_runner,
             pc_name=pc_name, save_dir=save_dir, deadline=time.time() + MAX_SEND_SECONDS)
@@ -843,6 +871,33 @@ class RollingBatch(threading.Thread):
             self.adb.key("BACK"); time.sleep(1.2)
         return bool(on_chat_list(self.adb))
 
+    def _recover_screen(self):
+        """The chat list went unreadable. Could be a transient read, a SCREEN-OFF/sleep, or a
+        LOCKED phone. Wake + re-assert stay-on + get back to the list. If the screen is off/locked
+        we WAIT for the user to unlock (never give up or stop); if the screen is on but still
+        unreadable it's a real glitch, so give up after ~1.5 min. Returns True once readable."""
+        dead = 0
+        while not self._stop.is_set():
+            if not self._device_ready() and not self._wait_device():
+                return False
+            on = screen_is_on(self.adb)
+            wake_unlock(self.adb, self.size)
+            keep_awake(self.adb, True)
+            self._ensure_list()
+            if visible_chats(self.adb):
+                return True
+            if on is False:
+                # screen off / secure lock -> wait for the user to unlock it; do NOT stop the run.
+                self.emit("log", "phone is LOCKED or screen is OFF - please UNLOCK it "
+                                 "(keep it plugged in); waiting...")
+                time.sleep(5); dead = 0
+            else:
+                dead += 1
+                if dead >= 30:            # screen on but unreadable for ~1.5 min -> real glitch
+                    return False
+                time.sleep(3)
+        return False
+
     def _swipe_down(self):
         # Drag symmetrically about the EXACT centre (cx, cy+off -> cy-off), staying in the middle
         # band so it never hits the bottom "home" gesture area (which would close WhatsApp).
@@ -933,6 +988,11 @@ class RollingBatch(threading.Thread):
         try:
             if not self._device_ready() and not self._wait_device():
                 self.emit("finished", {"exported": 0, "total": 0, "csv": self.csv_path}); return
+            try:                                  # remember the phone's own screen-off timeout to restore later
+                self._orig_sot = self.adb.shell("settings", "get", "system",
+                                                "screen_off_timeout", quiet=True).strip()
+            except Exception:
+                self._orig_sot = None
             keep_awake(self.adb, True)
             if not Path(self.save_dir).is_dir():
                 self.emit("log", f"WARNING: save folder '{self.save_dir}' does not exist - "
@@ -966,8 +1026,8 @@ class RollingBatch(threading.Thread):
 
             self.emit("log", f"rolling export started - CSV: {self.csv_path}")
             stale = 0
-            empty_reads = 0
             no_new = 0            # consecutive swipes that moved but revealed nothing new
+            loops = 0
             while not self._stop.is_set():
                 self._wait_pause()
                 if self._stop.is_set():
@@ -977,14 +1037,19 @@ class RollingBatch(threading.Thread):
                     if not self._wait_device():
                         break
                     time.sleep(1)
-                    keep_awake(self.adb, True); wake_unlock(self.adb)   # re-arm after reconnect
+                    keep_awake(self.adb, True); wake_unlock(self.adb, self.size)   # re-arm after reconnect
                     self._ensure_list()
+                loops += 1
+                if loops % 15 == 0:
+                    keep_awake(self.adb, True)       # periodically re-assert (stay-on can lapse)
                 try:
                     visible = [nm for _, nm in visible_chats(self.adb)]
                     if not visible:
-                        # screen unreadable at the top of the loop is often a LOCKED/OFF screen:
-                        # wake it, re-assert stay-on, and get back to the list before deciding.
-                        wake_unlock(self.adb); keep_awake(self.adb, True); self._ensure_list()
+                        # unreadable at the top of the loop -> often a LOCKED / screen-OFF phone.
+                        # Wake it, and WAIT for the user to unlock a secure lock, before deciding.
+                        if not self._recover_screen():
+                            self.emit("log", "chat list unreadable / could not recover - stopping")
+                            break
                         visible = [nm for _, nm in visible_chats(self.adb)]
                     for nm in visible:
                         if nm not in self.status:
@@ -1012,13 +1077,11 @@ class RollingBatch(threading.Thread):
                     before_swipe = visible
                     self._swipe_down()
                     after = [nm for _, nm in visible_chats(self.adb)]
-                    if not after:                      # empty read = screen-reader error, NOT the bottom
-                        empty_reads += 1
-                        if empty_reads >= 8:
-                            self.emit("log", "chat list unreadable repeatedly - stopping")
-                            break
-                        continue
-                    empty_reads = 0
+                    if not after:                      # empty read -> wake/unlock and retry (not bottom)
+                        if self._recover_screen():
+                            continue
+                        self.emit("log", "chat list unreadable / could not recover - stopping")
+                        break
                     if any(nm not in self.status for nm in after):
                         stale = 0; no_new = 0          # found new chats -> keep going
                     elif after == before_swipe:
@@ -1045,5 +1108,11 @@ class RollingBatch(threading.Thread):
                         pass
         finally:
             keep_awake(self.adb, False)
+            try:                                  # restore the phone's original screen-off timeout
+                if getattr(self, "_orig_sot", None) and self._orig_sot.isdigit():
+                    self.adb.shell("settings", "put", "system", "screen_off_timeout",
+                                   self._orig_sot, quiet=True)
+            except Exception:
+                pass
             self._write_csv()
             self.emit("finished", {"exported": exported, "total": len(self.order), "csv": self.csv_path})
