@@ -37,36 +37,57 @@ def sha256(path) -> str:
 
 
 def wait_for_new_file(folder, before: dict, timeout=120, stable_secs=2.0, poll=0.5, abort=None,
-                      fail_grace=10.0):
-    """Wait until a NEW file (not in `before`) appears in `folder` and its size stops growing for
-    `stable_secs`. Returns (path, size, sha256) or None on timeout.
+                      confirm=None, fail_grace=10.0):
+    """Wait until a NEW file (not in `before`) appears in `folder` and the transfer COMPLETES.
+    Returns (path, size, sha256) or None on timeout.
 
     `before` is a snapshot() taken just before the transfer was triggered.
-    `abort`, if given, is called each poll and returns one of: "stop" (bail immediately, e.g. the
-    user stopped), "failed" (the sender's screen shows a transfer 'Failed'), or a falsey value.
+    `abort`, if given, is called each poll and returns "stop" (bail immediately), "failed" (the
+    sender's screen shows a transfer 'Failed'), or falsey.
+    `confirm`, if given, returns True once the phone's Quick Share screen shows the transfer
+    'Completed'/'Done'. When the phone confirms Completed AND a file is present we accept it right
+    away (that's the definitive done signal); otherwise we wait for the file size to stop growing
+    for `stable_secs`. Either way we do NOT return mid-transfer.
     THE RECEIVED FILE ALWAYS WINS: a "failed" abort is honoured ONLY when no new file is arriving
-    and after `fail_grace` seconds - because the Quick Share screen shows ALL nearby devices, so a
-    stray 'Failed' from a DIFFERENT device must never cancel a transfer that actually succeeded."""
+    and after `fail_grace` seconds - the Quick Share screen lists ALL nearby devices, so a stray
+    'Failed' from a DIFFERENT device must never cancel a transfer that actually succeeded."""
     folder = str(folder)
     start = time.time()
     deadline = start + timeout
     stable_since = {}
     last_size = {}
+
+    def _finalize(name):
+        path = os.path.join(folder, name)
+        time.sleep(0.8)                        # let the last bytes flush before hashing
+        try:
+            return path, os.path.getsize(path), sha256(path)
+        except OSError:
+            return None
+
     while time.time() < deadline:
         now = snapshot(folder)
         got_new = False
+        newest = None
         for name, size in now.items():
             if name in before and before[name] == size:
                 continue                       # unchanged pre-existing file
             got_new = True                     # a new or growing file is present -> transfer alive
+            newest = name
             if last_size.get(name) == size and size > 0:
                 stable_since.setdefault(name, time.time())
                 if time.time() - stable_since[name] >= stable_secs:
-                    path = os.path.join(folder, name)
-                    return path, size, sha256(path)
+                    done = _finalize(name)
+                    if done:
+                        return done
             else:
                 stable_since.pop(name, None)   # size changed -> reset stability timer
             last_size[name] = size
+        # phone says the transfer COMPLETED and a file is here -> accept it now (definitive)
+        if got_new and newest and now.get(newest, 0) > 0 and confirm is not None and confirm():
+            done = _finalize(newest)
+            if done:
+                return done
         if abort is not None:
             a = abort()
             if a == "stop":

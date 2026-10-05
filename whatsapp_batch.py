@@ -103,6 +103,13 @@ def _norm_name(s):
     return (s or "").strip().strip(_NAME_MARKS).strip()
 
 
+def _fingerprint(s):
+    """Loose identity key for a chat name: lowercase letters+digits only. Used to catch the SAME
+    chat read with a slightly different name under load (dropped emoji, stray punctuation/space),
+    so it isn't treated as a new chat and exported again in a loop."""
+    return re.sub(r"[^0-9a-z]+", "", _norm_name(s).lower())
+
+
 def visible_chats(adb):
     """List of (y, name) for chat rows currently on screen, top -> bottom. Names are normalised
     (whitespace + invisible direction marks stripped) for stable de-duplication."""
@@ -621,20 +628,24 @@ def export_and_send(adb, case, size, emit_log=lambda m: None, outer_stop=None,
     # timeout; "Sent" is logged as progress. Fail fast on a blind send so a mega-chat can't waste
     # 10 min.
     emit_log(f"sent to {pc_name}; waiting for the file to arrive...")
-    phone = {"next": 0.0, "sent": False, "failed": False}
+    phone = {"next": 0.0, "sent": False, "failed": False, "completed": False}
 
     def _abort():
         # returns "stop" (bail now), "failed" (phone shows a 'Failed' - only acted on if NO file
         # is arriving, since the Quick Share screen lists OTHER nearby devices too and a stray
         # 'Failed' from a different device must never cancel a transfer that actually succeeded),
-        # or None.
+        # or None. Also reads the phone's "Completed"/"Done" (-> phone['completed']) and "Sent".
         if outer_stop is not None and outer_stop.is_set():
             return "stop"
         now = time.time()
         if now < phone["next"]:
             return None
-        phone["next"] = now + 4.0                       # throttle phone reads
+        phone["next"] = now + 3.0                       # throttle phone reads
         nodes = _nodes(adb)
+        if not phone["completed"] and (core.find_node(nodes, "Completed", "contains")
+                                       or core.find_node(nodes, "Done", "exact")):
+            phone["completed"] = True
+            emit_log("phone shows Quick Share 'Completed'")
         if core.find_node(nodes, "Failed", "contains"):
             if not phone["failed"]:
                 emit_log("phone shows a Quick Share 'Failed' (will still honour the received file)")
@@ -645,7 +656,8 @@ def export_and_send(adb, case, size, emit_log=lambda m: None, outer_stop=None,
             emit_log("phone shows Quick Share 'Sent' - finalising on PC")
         return None
 
-    res = bt.wait_for_new_file(save_dir, before, timeout=90 if blind else 600, abort=_abort)
+    res = bt.wait_for_new_file(save_dir, before, timeout=90 if blind else 600,
+                               abort=_abort, confirm=lambda: phone["completed"])
     _back_to_list(adb)
     if not res:
         # distinct reasons: the phone actively reported the send "Failed" (transfer dropped -
@@ -954,6 +966,7 @@ class RollingBatch(threading.Thread):
         self.start_from = start_from     # chat name to scroll to and begin at (skip everything above)
         self.only_names = None           # if set (a set of names), export ONLY these; skip others
         self.scan_order = None           # a pre-scanned ordered list of names (for directional seek)
+        self._done_fps = set()           # fingerprints of finished chats (loop/duplicate guard)
 
     def stop(self):
         self._stop.set()
@@ -1177,6 +1190,8 @@ class RollingBatch(threading.Thread):
                     self.status[nm] = "ok" if st.get(nm) == "ok" else "pending"
                     self.files[nm] = fl.get(nm, ("", "", ""))
                     self.times[nm] = tm.get(nm, "")
+                    if self.status[nm] == "ok":
+                        self._done_fps.add(_fingerprint(nm))   # don't re-export a variant of a done chat
                     self.emit("discover", nm)
                     self.emit("row", nm, self.status[nm])
                 done = sum(1 for nm in od if self.status.get(nm) == "ok")
@@ -1231,6 +1246,14 @@ class RollingBatch(threading.Thread):
                         visible = [nm for _, nm in visible_chats(self.adb)]
                     for nm in visible:
                         if nm not in self.status:
+                            # LOOP GUARD: if a chat we already FINISHED is read again with a slightly
+                            # different name (happens under load), its fingerprint matches -> skip it
+                            # as a duplicate instead of exporting it again.
+                            if _fingerprint(nm) in self._done_fps:
+                                self.status[nm] = "skipped"; self.order.append(nm)
+                                self.emit("discover", nm); self.emit("row", nm, "skipped")
+                                self.emit("log", f"duplicate of a finished chat - skipping: {nm!r}")
+                                continue
                             # export only the selected chats when a whitelist is set; skip the rest
                             sel = self.only_names is None or nm in self.only_names
                             self.status[nm] = "pending" if sel else "skipped"
@@ -1246,6 +1269,7 @@ class RollingBatch(threading.Thread):
                         self.emit("row", name, "running")
                         st = self._export_one(name)
                         self.status[name] = st
+                        self._done_fps.add(_fingerprint(name))   # finished -> never re-export a variant
                         self.emit("row", name, st)
                         if st == "ok":
                             exported += 1
