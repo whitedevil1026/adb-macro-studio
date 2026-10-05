@@ -476,14 +476,18 @@ def _do_export(adb, media, emit_log, outer_stop, left):
     return "stopped" if _stopped() else ("timeout" if left() <= 0 else "fail")
 
 
-def _back_to_list(adb, tries=10):
-    """Get back to the chat list after an export. We are NOT on the list here (we're on a share
-    sheet / dialog / inside a chat), so a BACK is safe and needed - including on an UNREADABLE
-    frame, which is usually a stuck dialog, not the list. We give the first couple of unreadable
-    frames a moment to settle, then press BACK regardless. This avoids the relaunch fallback
-    (which resets the list scroll to the top and makes long runs re-traverse / stop early)."""
+def _back_to_list(adb, tries=14):
+    """Get back to the chat list after an export. We are NOT on the list here (we're on the Quick
+    Share picker / Android share sheet / a dialog / inside a chat), so a BACK is safe and needed -
+    including on an UNREADABLE frame (the Android chooser returns NO nodes to uiautomator, so it
+    reads as 'unreadable' - we must still BACK out of it). We explicitly detect the chooser by its
+    foreground window and back out of it; otherwise we give a couple of unreadable frames a moment
+    to settle, then press BACK regardless. This avoids the relaunch fallback (which resets the list
+    scroll to the top and makes long runs re-traverse / stop early)."""
     none_streak = 0
     for _ in range(tries):
+        if on_share_sheet(adb):            # unreadable Quick Share chooser - just BACK out of it
+            adb.key("BACK"); time.sleep(1.2); none_streak = 0; continue
         st = on_chat_list(adb)
         if st:
             return True
@@ -809,6 +813,8 @@ class WhatsAppBatch(threading.Thread):
                     # record the media mode that was chosen even if the send later failed
                     # (blank only if we never reached the with/without-media choice)
                     self.files[name] = (Path(path).name if path else "", digest or "", media)
+                    if not self._stop.is_set():
+                        _back_to_list(self.adb)      # guarantee we're off the share sheet/picker
                     if self._stop.is_set():
                         self.emit("progress", i, total, name, "stopped"); break
                     self.emit("progress", i, total, name, status)
@@ -1098,6 +1104,11 @@ class RollingBatch(threading.Thread):
         # record the media mode that was chosen even if the send later failed
         # (blank only if we never reached the with/without-media choice)
         self.files[name] = (Path(path).name if path else "", digest or "", media)
+        # GUARANTEE we are back on the chat list before the next chat - after exhausting the
+        # retries the phone can be left on the (unreadable) Quick Share chooser/picker, which would
+        # break the next chat. This robustly dismisses it (never relaunches unless truly stuck).
+        if not self._stop.is_set():
+            _back_to_list(self.adb)
         return status
 
     def run(self):
