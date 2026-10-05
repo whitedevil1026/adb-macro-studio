@@ -624,21 +624,26 @@ def export_and_send(adb, case, size, emit_log=lambda m: None, outer_stop=None,
     phone = {"next": 0.0, "sent": False, "failed": False}
 
     def _abort():
+        # returns "stop" (bail now), "failed" (phone shows a 'Failed' - only acted on if NO file
+        # is arriving, since the Quick Share screen lists OTHER nearby devices too and a stray
+        # 'Failed' from a different device must never cancel a transfer that actually succeeded),
+        # or None.
         if outer_stop is not None and outer_stop.is_set():
-            return True
+            return "stop"
         now = time.time()
         if now < phone["next"]:
-            return False
+            return None
         phone["next"] = now + 4.0                       # throttle phone reads
         nodes = _nodes(adb)
         if core.find_node(nodes, "Failed", "contains"):
+            if not phone["failed"]:
+                emit_log("phone shows a Quick Share 'Failed' (will still honour the received file)")
             phone["failed"] = True
-            emit_log("phone shows Quick Share 'Failed'")
-            return True
+            return "failed"
         if not phone["sent"] and core.find_node(nodes, "Sent", "contains"):
             phone["sent"] = True
             emit_log("phone shows Quick Share 'Sent' - finalising on PC")
-        return False
+        return None
 
     res = bt.wait_for_new_file(save_dir, before, timeout=90 if blind else 600, abort=_abort)
     _back_to_list(adb)

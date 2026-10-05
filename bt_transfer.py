@@ -36,25 +36,29 @@ def sha256(path) -> str:
     return h.hexdigest()
 
 
-def wait_for_new_file(folder, before: dict, timeout=120, stable_secs=2.0, poll=0.5, abort=None):
-    """Wait until a NEW file (not in `before`) appears in `folder` and its size stops
-    growing for `stable_secs`. Returns (path, size, sha256) or None on timeout.
+def wait_for_new_file(folder, before: dict, timeout=120, stable_secs=2.0, poll=0.5, abort=None,
+                      fail_grace=10.0):
+    """Wait until a NEW file (not in `before`) appears in `folder` and its size stops growing for
+    `stable_secs`. Returns (path, size, sha256) or None on timeout.
 
     `before` is a snapshot() taken just before the transfer was triggered.
-    `abort`, if given, is called each poll; if it returns True we stop early and return None
-    (used to bail as soon as the sender shows the transfer 'Failed')."""
+    `abort`, if given, is called each poll and returns one of: "stop" (bail immediately, e.g. the
+    user stopped), "failed" (the sender's screen shows a transfer 'Failed'), or a falsey value.
+    THE RECEIVED FILE ALWAYS WINS: a "failed" abort is honoured ONLY when no new file is arriving
+    and after `fail_grace` seconds - because the Quick Share screen shows ALL nearby devices, so a
+    stray 'Failed' from a DIFFERENT device must never cancel a transfer that actually succeeded."""
     folder = str(folder)
-    deadline = time.time() + timeout
+    start = time.time()
+    deadline = start + timeout
     stable_since = {}
     last_size = {}
     while time.time() < deadline:
-        if abort is not None and abort():
-            return None
         now = snapshot(folder)
+        got_new = False
         for name, size in now.items():
             if name in before and before[name] == size:
                 continue                       # unchanged pre-existing file
-            # a new or growing file
+            got_new = True                     # a new or growing file is present -> transfer alive
             if last_size.get(name) == size and size > 0:
                 stable_since.setdefault(name, time.time())
                 if time.time() - stable_since[name] >= stable_secs:
@@ -63,6 +67,12 @@ def wait_for_new_file(folder, before: dict, timeout=120, stable_secs=2.0, poll=0
             else:
                 stable_since.pop(name, None)   # size changed -> reset stability timer
             last_size[name] = size
+        if abort is not None:
+            a = abort()
+            if a == "stop":
+                return None                    # user stop -> immediate
+            if a == "failed" and not got_new and (time.time() - start) > fail_grace:
+                return None                    # real failure: no file arriving, grace elapsed
         time.sleep(poll)
     return None
 
