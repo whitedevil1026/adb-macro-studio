@@ -550,7 +550,11 @@ def export_and_send(adb, case, size, emit_log=lambda m: None, outer_stop=None,
     # never be read - go straight to the learned position. Only try reading it when the chooser
     # isn't (yet) the recognised foreground.
     qs_node = None
-    if not on_share_sheet(adb):
+    # If the chooser is foreground AND we already know where Quick Share is, blind-tap directly -
+    # the chooser is unreadable so reading would only waste time. Otherwise TRY to read it: we need
+    # a readable node to learn its position (and the chooser is only *sometimes* unreadable, so a
+    # longer wait can catch a readable moment on the first run of a new device).
+    if not (on_share_sheet(adb) and cached.get("qs")):
         qs_node = _wait_node(adb, "Quick Share",
                              max(2, min(40 if cached.get("qs") else 240, _left())), stop=outer_stop)
     before = bt.snapshot(save_dir)
