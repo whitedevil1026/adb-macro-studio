@@ -317,6 +317,35 @@ def _wait_node(adb, text, timeout=30, match="contains", stop=None):
     return None
 
 
+def _wait_pc_node(adb, pc_name, timeout=30, stop=None):
+    """Find the Quick Share device-picker tile for EXACTLY `pc_name`. STRICT on purpose: it only
+    accepts a device whose name equals pc_name (optionally followed by a status like 'Available'),
+    so it can NEVER tap a different nearby device whose name merely contains pc_name as a substring
+    - critical because this selects the RECIPIENT. If two different device names would match, it
+    refuses (returns None) rather than guess."""
+    want = _norm_name(pc_name).lower()
+    if not want:
+        return None
+    end = time.time() + timeout
+    while time.time() < end:
+        if stop is not None and stop.is_set():
+            return None
+        hits, seen = [], set()
+        for n in _nodes(adb):
+            for f in (n.get("text"), n.get("desc")):
+                if not f:
+                    continue
+                fl = _norm_name(f).lower()
+                if fl == want or fl.startswith(want + " ") or fl.startswith(want + "("):
+                    hits.append(n); seen.add(fl); break
+        if len(seen) == 1 and hits:          # exactly ONE device name matched -> safe to tap it
+            return hits[0]
+        if len(seen) > 1:                    # ambiguous (multiple device names match) -> refuse
+            return None
+        time.sleep(0.7)
+    return None
+
+
 def _wait_either(adb, text_a, text_b, timeout=60, match="contains", stop=None):
     """Return 'a' if text_a appears first, 'b' if text_b appears first, None on timeout/stop."""
     end = time.time() + timeout
@@ -571,9 +600,11 @@ def export_and_send(adb, case, size, emit_log=lambda m: None, outer_stop=None,
         _back_to_list(adb)
         return ("fail-timeout" if _left() <= 0 else "fail-noshare"), None, None, media["mode"]
 
-    # --- find & tap the PC in the device picker (screen-reader, else learned position) ---
+    # --- find & tap the PC in the device picker ---
+    # STRICT match on the exact PC name so we never send to a different nearby device whose name
+    # merely contains the PC name (sending to the wrong recipient is unacceptable).
     cached = _COORDS.get(key, {})
-    pc_node = _wait_node(adb, pc_name, max(2, min(25 if cached.get("pc") else 60, _left())), stop=outer_stop)
+    pc_node = _wait_pc_node(adb, pc_name, max(2, min(25 if cached.get("pc") else 60, _left())), stop=outer_stop)
     if pc_node is not None:
         _COORDS.setdefault(key, {})["pc"] = list(core.node_center(pc_node)); _save_coords()
         adb.tap(*core.node_center(pc_node)); time.sleep(2.0)
