@@ -15,6 +15,9 @@ Built for workflows where you repeat the same on-screen steps across many device
 
 There is also a **headless CLI** (`adb_cli.py`) for machines with no display.
 
+> 📄 For how the WhatsApp batch exporter guarantees a **complete, non-duplicated, verifiable**
+> collection (and what to watch for in the field), see **[docs/RELIABILITY.md](docs/RELIABILITY.md)**.
+
 > ⚠️ **Use responsibly.** Only use this on devices you own or are explicitly authorized to
 > access. Enabling USB debugging and sending input events modifies device state; in a
 > forensic context, document what you do. This project is provided as-is under the MIT license.
