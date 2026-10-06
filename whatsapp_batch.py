@@ -11,7 +11,9 @@ from __future__ import annotations
 import copy
 import csv
 import json
+import os
 import re
+import shutil
 import threading
 import time
 from pathlib import Path
@@ -728,19 +730,15 @@ class WhatsAppBatch(threading.Thread):
         self.results = []
 
     def _write_csv(self):
-        try:
-            now = core.now_iso()
-            with open(self.csv_path, "w", newline="", encoding="utf-8") as f:
-                wr = csv.writer(f)
-                wr.writerow(["#", "chat", "status", "media", "saved_file", "sha256", "time"])
-                for i, (nm, st) in enumerate(self.results, 1):
-                    self.times.setdefault(nm, now)   # stamp on first write = completion time
-                    fn, digest, media = self.files.get(nm, ("", "", ""))
-                    if not media and st.startswith("fail"):
-                        media = "not exported"       # chat never opened -> no media choice made
-                    wr.writerow([i, _csv_safe(nm), st, media, _csv_safe(fn), digest, self.times[nm]])
-        except Exception as e:
-            self.emit("log", f"csv write failed: {e}")
+        now = core.now_iso()
+        rows = []
+        for i, (nm, st) in enumerate(self.results, 1):
+            self.times.setdefault(nm, now)   # stamp on first write = completion time
+            fn, digest, media = self.files.get(nm, ("", "", ""))
+            if not media and st.startswith("fail"):
+                media = "not exported"       # chat never opened -> no media choice made
+            rows.append([i, _csv_safe(nm), st, media, _csv_safe(fn), digest, self.times[nm]])
+        write_csv_atomic(self.csv_path, rows, lambda m: self.emit("log", m))
 
     def stop(self):
         self._stop.set()
@@ -904,25 +902,57 @@ def _csv_unsafe(s):
     return s
 
 
+CSV_HEADER = ["#", "chat", "status", "media", "saved_file", "sha256", "time"]
+
+
+def write_csv_atomic(path, rows, log=lambda m: None):
+    """Write the exported-chats CSV so it can NEVER be lost (it's evidence):
+    - writes to a temp file then atomically replaces the target (a crash mid-write can't corrupt it);
+    - makes the parent folder if missing;
+    - REFUSES to overwrite an existing non-empty CSV with an EMPTY table (so a failed/empty run
+      never erases prior progress)."""
+    try:
+        if not rows:
+            if os.path.exists(path) and os.path.getsize(path) > 0:
+                return                       # don't truncate real data to nothing
+        d = os.path.dirname(os.path.abspath(path))
+        if d:
+            os.makedirs(d, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", newline="", encoding="utf-8") as f:
+            wr = csv.writer(f)
+            wr.writerow(CSV_HEADER)
+            for r in rows:
+                wr.writerow(r)
+        os.replace(tmp, path)                # atomic on the same filesystem
+    except Exception as e:
+        log(f"csv write failed: {e}")
+        try:
+            if os.path.exists(path + ".tmp"):
+                os.remove(path + ".tmp")
+        except Exception:
+            pass
+
+
 def load_progress(csv_path):
     """Read a prior exported_chats.csv so a run can RESUME. Returns (status, order, files, times)
     where status maps chat-name -> the recorded status. Callers keep chats already 'ok' (skip
-    them) and re-queue everything else."""
+    them) and re-queue everything else. Raises on a real read error (a locked/corrupt file) so the
+    caller can ABORT instead of proceeding with empty data that might overwrite the evidence."""
     status, order, files, times = {}, [], {}, {}
-    try:
-        with open(csv_path, newline="", encoding="utf-8") as f:
-            for row in csv.DictReader(f):
-                nm = _csv_unsafe((row.get("chat") or "").strip())
-                if not nm:
-                    continue
-                if nm not in status:
-                    order.append(nm)
-                status[nm] = (row.get("status") or "").strip()
-                files[nm] = (_csv_unsafe(row.get("saved_file") or ""),
-                             row.get("sha256") or "", row.get("media") or "")
-                times[nm] = row.get("time") or ""
-    except FileNotFoundError:
-        pass
+    if not os.path.exists(csv_path):
+        return status, order, files, times
+    with open(csv_path, newline="", encoding="utf-8", errors="replace") as f:
+        for row in csv.DictReader(f):
+            nm = _csv_unsafe((row.get("chat") or "").strip())
+            if not nm:
+                continue
+            if nm not in status:
+                order.append(nm)
+            status[nm] = (row.get("status") or "").strip()
+            files[nm] = (_csv_unsafe(row.get("saved_file") or ""),
+                         row.get("sha256") or "", row.get("media") or "")
+            times[nm] = row.get("time") or ""
     return status, order, files, times
 
 
@@ -1126,22 +1156,17 @@ class RollingBatch(threading.Thread):
         return False
 
     def _write_csv(self):
-        try:
-            now = core.now_iso()
-            with open(self.csv_path, "w", newline="", encoding="utf-8") as f:
-                wr = csv.writer(f)
-                wr.writerow(["#", "chat", "status", "media", "saved_file", "sha256", "time"])
-                for i, nm in enumerate(self.order, 1):
-                    st = self.status.get(nm, "")
-                    if st and st not in ("pending", "running"):   # terminal -> stamp once
-                        self.times.setdefault(nm, now)
-                    fn, digest, media = self.files.get(nm, ("", "", ""))
-                    if not media and st.startswith("fail"):
-                        media = "not exported"       # chat never opened -> no media choice made
-                    wr.writerow([i, _csv_safe(nm), st, media,
-                                 _csv_safe(fn), digest, self.times.get(nm, "")])
-        except Exception as e:
-            self.emit("log", f"csv write failed: {e}")
+        now = core.now_iso()
+        rows = []
+        for i, nm in enumerate(self.order, 1):
+            st = self.status.get(nm, "")
+            if st and st not in ("pending", "running"):   # terminal -> stamp once
+                self.times.setdefault(nm, now)
+            fn, digest, media = self.files.get(nm, ("", "", ""))
+            if not media and st.startswith("fail"):
+                media = "not exported"       # chat never opened -> no media choice made
+            rows.append([i, _csv_safe(nm), st, media, _csv_safe(fn), digest, self.times.get(nm, "")])
+        write_csv_atomic(self.csv_path, rows, lambda m: self.emit("log", m))
 
     def _export_one(self, name):
         def reopen():
@@ -1183,7 +1208,21 @@ class RollingBatch(threading.Thread):
             # RESUME: pre-load a prior run's CSV. Chats already 'ok' are kept (skipped); every
             # other chat is re-queued as pending so it gets retried.
             if self.resume_from:
-                st, od, fl, tm = load_progress(self.resume_from)
+                # BACK UP the source CSV first - it's evidence; never risk losing it on resume.
+                try:
+                    bak = self.resume_from + time.strftime(".%Y%m%d_%H%M%S.bak")
+                    shutil.copy2(self.resume_from, bak)
+                    self.emit("log", f"resume: backed up source CSV -> {os.path.basename(bak)}")
+                except Exception as e:
+                    self.emit("log", f"resume: could not back up source CSV ({e})")
+                try:
+                    st, od, fl, tm = load_progress(self.resume_from)
+                except Exception as e:
+                    # could NOT read the resume CSV (locked/corrupt). ABORT rather than proceed with
+                    # empty data that might overwrite the evidence.
+                    self.emit("log", f"resume FAILED to read '{self.resume_from}': {e} - aborting "
+                                     f"(nothing overwritten)")
+                    self.emit("finished", {"exported": 0, "total": 0, "csv": self.csv_path}); return
                 for nm in od:
                     if nm not in self.order:
                         self.order.append(nm)
