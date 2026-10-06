@@ -934,6 +934,21 @@ def write_csv_atomic(path, rows, log=lambda m: None):
             pass
 
 
+def latest_csv_for_serial(cases_dir, serial):
+    """Find the most recent non-empty exported_chats.csv for THIS device (its serial is in the
+    case folder name, '<timestamp>_<serial>'). Returns the path or None. This is how a restart on
+    the SAME mobile continues the SAME CSV, while a DIFFERENT mobile (different serial) gets none
+    and starts fresh."""
+    if not serial:
+        return None
+    import glob
+    pat = os.path.join(str(cases_dir), f"*_{serial}", "exported_chats.csv")
+    found = [c for c in glob.glob(pat) if os.path.isfile(c) and os.path.getsize(c) > 0]
+    if not found:
+        return None
+    return max(found, key=os.path.getmtime)
+
+
 def load_progress(csv_path):
     """Read a prior exported_chats.csv so a run can RESUME. Returns (status, order, files, times)
     where status maps chat-name -> the recorded status. Callers keep chats already 'ok' (skip

@@ -503,6 +503,18 @@ class BatchExportWindow(tk.Toplevel):
         scan_order = [self.tree.item(iid, "values")[0] for iid in self.tree.get_children()]
         sel_names = {self.tree.item(iid, "values")[0] for iid in self.tree.selection()}
         startf = self.startfrom_var.get().strip() or None
+        # SAME-DEVICE CONTINUITY: if the user didn't explicitly pick a CSV, auto-continue THIS
+        # device's most recent CSV (keyed on serial) in place - so restarting on the same mobile
+        # keeps the same CSV and all prior progress. A different mobile (different serial) finds
+        # none and starts a fresh CSV.
+        resume = self.resume_path
+        csv_override = self.resume_path          # continue the picked file in place
+        if not resume:
+            prev = wb.latest_csv_for_serial(str(CASE_DIR), self.app.serial)
+            if prev:
+                resume = prev
+                csv_override = prev
+                self._log(f"continuing this device's previous CSV: {prev}")
         self.tree.delete(*self.tree.get_children())
         self.row_of.clear()
         self.order = []
@@ -512,10 +524,10 @@ class BatchExportWindow(tk.Toplevel):
             self.app._live_pause.set()
         self.start_btn.config(state="disabled")
         self.batch = wb.RollingBatch(self.app.adb, self.app.case, self.app.cur_size,
-                                     self._emit, pause=self.pause_evt,
+                                     self._emit, pause=self.pause_evt, csv_path=csv_override,
                                      pc_name=self.pc_var.get().strip() or wb.PC_NAME,
                                      save_dir=self.dir_var.get().strip() or wb.SAVE_DIR,
-                                     resume_from=self.resume_path,
+                                     resume_from=resume,
                                      start_from=startf)
         self.batch.scan_order = scan_order or None     # lets start-from go directionally (up/down)
         # start-from takes precedence; otherwise a selection means "export only these"
