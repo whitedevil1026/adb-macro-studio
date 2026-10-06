@@ -749,7 +749,10 @@ def export_and_send(adb, case, size, emit_log=lambda m: None, outer_stop=None,
     # see progress), extended while the phone keeps showing progress, up to a hard ceiling. The floor
     # is the latency of a GENUINE failure (file never comes, no progress), so keep it modest - a
     # successful transfer returns the instant the file lands, long before the floor.
-    floor_until = time.time() + (90 if blind else 150)
+    # BLIND (transfer screen unreadable): we can't see progress, so wait a longer minimum in case a
+    # transfer is silently happening. READABLE: progress is visible, so the activity-extension below
+    # covers any slow transfer and a short floor is enough - this keeps a genuine failure fast.
+    floor_until = time.time() + (90 if blind else 45)
     hard_cap = time.time() + (600 if blind else 1200)
     res = None
     while time.time() < hard_cap:
@@ -1135,6 +1138,15 @@ class WhatsAppBatch(threading.Thread):
                         self._ensure_list()
                     except core.AdbError:
                         pass
+                except Exception as e:
+                    # one chat's unexpected error must not abort the whole selected-export run
+                    self.emit("log", f"unexpected error on {name!r} (continuing): {e!r}")
+                    self.emit("progress", i, total, name, "fail-error")
+                    self.results.append((name, "fail-error"))
+                    try:
+                        self._ensure_list()
+                    except Exception:
+                        pass
         finally:
             pc_keep_awake(False)       # release the PC sleep/display lock
             try:
@@ -1475,6 +1487,7 @@ class RollingBatch(threading.Thread):
 
     def run(self):
         exported = 0
+        unexpected = 0                             # count of non-AdbError errors (safety bail at 30)
         try:
             if not self._device_ready() and not self._wait_device():
                 self.emit("finished", {"exported": 0, "total": 0, "csv": self.csv_path}); return
@@ -1644,6 +1657,19 @@ class RollingBatch(threading.Thread):
                         self._ensure_list()
                     except core.AdbError:
                         pass
+                except Exception as e:
+                    # a single unexpected error on one chat must NEVER kill the whole evidence run:
+                    # log it, try to get back to the list, and carry on. Bail only if they pile up.
+                    unexpected += 1
+                    self.emit("log", f"unexpected error (continuing, {unexpected}/30): {e!r}")
+                    if unexpected >= 30:
+                        self.emit("log", "too many unexpected errors - stopping (safety)")
+                        break
+                    try:
+                        self._ensure_list()
+                    except Exception:
+                        pass
+                    time.sleep(1.0)
         finally:
             pc_keep_awake(False)                  # release the PC sleep/display lock
             keep_awake(self.adb, False)
