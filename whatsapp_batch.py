@@ -106,10 +106,16 @@ def _norm_name(s):
 
 
 def _fingerprint(s):
-    """Loose identity key for a chat name: lowercase letters+digits only. Used to catch the SAME
-    chat read with a slightly different name under load (dropped emoji, stray punctuation/space),
-    so it isn't treated as a new chat and exported again in a loop."""
-    return re.sub(r"[^0-9a-z]+", "", _norm_name(s).lower())
+    """Loose identity key for a chat name: lowercase letters+digits of ANY script, with
+    whitespace/punctuation/emoji/direction-marks removed. Used to catch the SAME chat read with a
+    slightly different name under load (dropped emoji, stray punctuation/space) so it isn't exported
+    again in a loop.
+
+    CRITICAL: keep Unicode word characters, not just ASCII. A name in a regional script
+    (Telugu/Hindi/Arabic/CJK...) or an emoji-only name must NOT collapse to "" - otherwise the first
+    such finished chat would poison the done-set and mass-skip every other non-Latin-named chat.
+    Callers MUST treat a "" fingerprint as unique (never a duplicate)."""
+    return re.sub(r"[\W_]+", "", _norm_name(s).lower(), flags=re.UNICODE)
 
 
 def visible_chats(adb):
@@ -164,6 +170,28 @@ def keep_awake(adb, on=True):
         pass
 
 
+_ES_CONTINUOUS = 0x80000000
+_ES_SYSTEM_REQUIRED = 0x00000001
+_ES_DISPLAY_REQUIRED = 0x00000002
+
+
+def pc_keep_awake(on=True):
+    """Keep the PC (and its display) awake for the whole batch - the Windows equivalent of the
+    phone's keep_awake. An unattended run can take hours, and if Windows sleeps, Quick Share stops
+    receiving and pywinauto can't click Accept. Uses SetThreadExecutionState, which stays in effect
+    on the calling thread until cleared (so call it from the batch thread and clear it in finally).
+    No-op / best-effort off Windows."""
+    try:
+        import ctypes
+        if on:
+            ctypes.windll.kernel32.SetThreadExecutionState(
+                _ES_CONTINUOUS | _ES_SYSTEM_REQUIRED | _ES_DISPLAY_REQUIRED)
+        else:
+            ctypes.windll.kernel32.SetThreadExecutionState(_ES_CONTINUOUS)
+    except Exception:
+        pass
+
+
 def screen_is_on(adb):
     """Best-effort display state: True = on, False = off, None = unknown."""
     try:
@@ -194,6 +222,49 @@ def on_share_sheet(adb):
                     or "ResolverActivity" in line or "com.android.internal.app.ChooserActivity" in line):
                 return True
     return False
+
+
+def dismiss_anr(adb):
+    """Detect Android's "WhatsApp isn't responding" (ANR) dialog and tap WAIT to keep the app
+    alive, instead of letting the run stall behind it (or the app get killed). WhatsApp ANRs when
+    uiautomator reads hammer a busy/media-heavy phone. Returns True if an ANR dialog was handled.
+    Best-effort and cheap - safe to call at the top of the main loop."""
+    try:
+        nodes = _nodes(adb)
+    except Exception:
+        return False
+    hit = (core.find_node(nodes, "isn't responding", "contains")
+           or core.find_node(nodes, "not responding", "contains")
+           or core.find_node(nodes, "Close app", "contains"))
+    if not hit:
+        return False
+    # prefer "Wait" (keep the app running); fall back to just dismissing the dialog.
+    if not _tap_text(adb, "Wait", timeout=4, match="contains", delay=1.0):
+        try:
+            adb.key("BACK")
+        except Exception:
+            pass
+    return True
+
+
+def _device_wait_reason(adb_path):
+    """A human-readable reason the batch is waiting for the device, so a long "initialisation" is
+    never a mystery. Explains the ACTUAL adb state (unauthorized / offline / none)."""
+    try:
+        devs = core.Adb(adb_path).devices()
+    except Exception as e:
+        return f"waiting for device - cannot run adb ({e})"
+    if not devs:
+        return ("waiting for device - none detected. Check the USB cable/port, keep the phone "
+                "UNLOCKED, and make sure File Transfer (MTP) + USB debugging are on.")
+    states = ", ".join(f"{d.get('serial','?')}={d.get('state','?')}" for d in devs)
+    if any(d.get("state") == "unauthorized" for d in devs):
+        return (f"waiting for device - UNAUTHORIZED ({states}). Unlock the phone and tap "
+                "'Allow'/'Always allow' on the USB-debugging prompt.")
+    if any(d.get("state") == "offline" for d in devs):
+        return (f"waiting for device - OFFLINE ({states}). Re-seat the USB cable (or toggle USB "
+                "debugging); the phone is connected but not responding to adb yet.")
+    return f"waiting for device to become ready ({states})"
 
 
 def wake_unlock(adb, size=None):
@@ -625,18 +696,24 @@ def export_and_send(adb, case, size, emit_log=lambda m: None, outer_stop=None,
         _back_to_list(adb)
         return ("fail-timeout" if _left() <= 0 else "fail-pcpick"), None, None, media["mode"]
 
-    # Wait for the file on the PC (definitive success), while ALSO reading the phone's Quick Share
-    # status: if it shows "Failed" we bail immediately (fast retry) instead of waiting the whole
-    # timeout; "Sent" is logged as progress. Fail fast on a blind send so a mega-chat can't waste
-    # 10 min.
+    # Wait for the file on the PC (the definitive success signal), reading the phone's Quick Share
+    # screen as we go. KEY: a chat with a big attachment (a long PDF, a video) transfers SLOWLY, so
+    # we must NOT give up on a fixed timeout - that was declaring a slow-but-fine transfer "failed"
+    # and re-sending it (duplicate (1)(2)(3).zip). Instead we keep waiting as long as the transfer
+    # is genuinely ALIVE (the phone shows Sending/progress, or already Completed), and only give up
+    # when there's no file AND no visible progress for a while.
     emit_log(f"sent to {pc_name}; waiting for the file to arrive...")
-    phone = {"next": 0.0, "sent": False, "failed": False, "completed": False}
+    phone = {"next": 0.0, "sent": False, "failed": False, "completed": False,
+             "active_at": 0.0, "completed_at": 0.0}
 
     def _abort():
-        # returns "stop" (bail now), "failed" (phone shows a 'Failed' - only acted on if NO file
-        # is arriving, since the Quick Share screen lists OTHER nearby devices too and a stray
-        # 'Failed' from a different device must never cancel a transfer that actually succeeded),
-        # or None. Also reads the phone's "Completed"/"Done" (-> phone['completed']) and "Sent".
+        # returns "stop" (user stop -> bail now) or None. We DO NOT fast-fail on a phone 'Failed':
+        # Quick Share writes the received file atomically at the END of the transfer, so no file is
+        # visible mid-flight, and the phone's screen lists EVERY nearby device - an early/stray
+        # 'Failed' (often from a DIFFERENT device) used to trip a retry that re-sent the chat and
+        # created duplicate (1)(2)(3).zip files. The received file + 'Completed' + the activity-aware
+        # wait are the verdict. We READ 'Completed'/'Done' (-> fast definitive success), track
+        # in-progress signals (Sending/%/Receiving... -> active_at), and log 'Sent'/'Failed'.
         if outer_stop is not None and outer_stop.is_set():
             return "stop"
         now = time.time()
@@ -647,41 +724,187 @@ def export_and_send(adb, case, size, emit_log=lambda m: None, outer_stop=None,
         if not phone["completed"] and (core.find_node(nodes, "Completed", "contains")
                                        or core.find_node(nodes, "Done", "exact")):
             phone["completed"] = True
+            phone["completed_at"] = now
             emit_log("phone shows Quick Share 'Completed'")
-        if core.find_node(nodes, "Failed", "contains"):
-            if not phone["failed"]:
-                emit_log("phone shows a Quick Share 'Failed' (will still honour the received file)")
+        # transfer-in-progress signals -> the transfer is ALIVE, keep waiting (big files are slow)
+        for n in nodes:
+            for f in (n.get("text"), n.get("desc")):
+                if not f:
+                    continue
+                fl = f.lower()
+                if ("sending" in fl or "receiving" in fl or "waiting for" in fl
+                        or "connecting" in fl or "preparing" in fl or "transferring" in fl
+                        or re.search(r"\d+\s*%", fl) or re.search(r"\d+(\.\d+)?\s*[mk]b/s", fl)):
+                    phone["active_at"] = now
+                    break
+        if not phone["failed"] and core.find_node(nodes, "Failed", "contains"):
             phone["failed"] = True
-            return "failed"
+            emit_log("phone screen shows a 'Failed' (ignored - the received file decides)")
         if not phone["sent"] and core.find_node(nodes, "Sent", "contains"):
             phone["sent"] = True
             emit_log("phone shows Quick Share 'Sent' - finalising on PC")
         return None
 
-    res = bt.wait_for_new_file(save_dir, before, timeout=90 if blind else 600,
-                               abort=_abort, confirm=lambda: phone["completed"])
+    # activity-aware wait: a minimum "floor" (in case the transfer screen is unreadable so we can't
+    # see progress), extended while the phone keeps showing progress, up to a hard ceiling. The floor
+    # is the latency of a GENUINE failure (file never comes, no progress), so keep it modest - a
+    # successful transfer returns the instant the file lands, long before the floor.
+    floor_until = time.time() + (90 if blind else 150)
+    hard_cap = time.time() + (600 if blind else 1200)
+    res = None
+    while time.time() < hard_cap:
+        if outer_stop is not None and outer_stop.is_set():
+            break
+        res = bt.wait_for_new_file(save_dir, before, timeout=30,
+                                   abort=_abort, confirm=lambda: phone["completed"])
+        if res:
+            break
+        if phone["completed"]:
+            # phone says done -> the file should land within seconds. Give it a short grace, then
+            # STOP (don't loop to the 10-min cap): 'Completed' with no file = wrong Save folder.
+            if time.time() - phone["completed_at"] < 45:
+                continue
+            break
+        if time.time() - phone["active_at"] < 25:
+            continue                                   # transfer still showing progress -> wait on
+        if time.time() < floor_until:
+            continue                                   # can't see progress yet -> honour the floor
+        break                                          # no file, no progress -> genuinely done/failed
     _back_to_list(adb)
     if not res:
-        # distinct reasons: the phone actively reported the send "Failed" (transfer dropped -
-        # Bluetooth/Wi-Fi) vs the file simply never arrived within the timeout (PC not receiving,
-        # asleep, wrong save folder). Both are retried.
-        if phone["failed"]:
-            return "fail-sent", None, None, media["mode"]
-        return "fail-transfer", None, None, media["mode"]
+        # the file never arrived AND the transfer stopped showing progress: a real failure (PC not
+        # receiving / asleep / wrong save folder / transfer dropped). Retried.
+        if phone["completed"]:
+            # the phone SAYS it completed but nothing landed in save_dir -> almost always the Save
+            # folder isn't the real Quick Share destination. Retrying won't help; flag it loudly.
+            emit_log(f"WARNING: phone shows 'Completed' but no file appeared in '{save_dir}'. "
+                     "The Save folder is probably NOT where Quick Share saves - fix it to stop "
+                     "every transfer being counted as failed.")
+        return ("fail-sent" if phone["failed"] else "fail-transfer"), None, None, media["mode"]
     path, nbytes, digest = res
+    # VERIFY the received .zip actually opens and read its real contents (authoritative over the
+    # UI-flow guess). A big attachment whose transfer was cut short lands as a TRUNCATED/corrupt zip;
+    # recording that as 'ok' would be bad evidence, so a zip that won't open is treated as a failure
+    # and retried. A valid zip also makes the CSV 'media' column truthful and explains file sizes.
+    label = media["mode"]
     try:
-        case.record_file(Path(path), f"whatsapp export ({media['mode']}) via Quick Share")
+        info = bt.zip_media_info(path)
+    except Exception as e:
+        info = {"ok": False, "error": str(e)}
+    if not info.get("ok"):
+        emit_log(f"received file is not a valid/complete zip ({info.get('error')}) - treating as a "
+                 "failed transfer and retrying")
+        return "fail-transfer", None, None, media["mode"]
+    label = info["label"]                               # "with media"/"without media" from the zip itself
+    emit_log(f"verified contents: {info['files']} files, {info['media']} media, "
+             f"{info['media_bytes']/1e6:.1f} MB media ({label})")
+    if label != media["mode"]:
+        emit_log(f"note: UI flow attempted '{media['mode']}' but the file is '{label}'")
+    try:
+        case.record_file(Path(path), f"whatsapp export ({label}) via Quick Share")
     except Exception:
         pass
-    emit_log(f"received {Path(path).name} ({nbytes} bytes, {media['mode']})")
-    return "ok", path, digest, media["mode"]
+    emit_log(f"received {Path(path).name} ({nbytes} bytes, {label})")
+    return "ok", path, digest, label
+
+
+def _late_arrived_file(save_dir, before, settle=2.0):
+    """A transfer the timeout cut off can still land a moment later. Return (path, bytes, sha256)
+    for a NEW, size-stable file that appeared since `before`, else None. This is the last guard
+    against a duplicate: if the file is already here, we must NOT re-send the chat."""
+    if not save_dir:
+        return None
+    try:
+        now = bt.snapshot(save_dir)
+        cands = [n for n, s in now.items() if s > 0 and (n not in before or before.get(n) != s)]
+        if not cands:
+            return None
+        newest = max(cands, key=lambda n: os.path.getmtime(os.path.join(save_dir, n)))
+        p = os.path.join(save_dir, newest)
+        s1 = os.path.getsize(p)
+        time.sleep(settle)
+        if os.path.getsize(p) != s1:                       # still growing -> not finished
+            return None
+        if p.lower().endswith(".zip") and not bt.zip_media_info(p).get("ok"):
+            return None                                    # partial/corrupt zip -> not a real success
+        return p, s1, bt.sha256(p)
+    except OSError:
+        return None
+
+
+def _await_late_file(adb, save_dir, before, emit_log, outer_stop, timeout=200):
+    """The foolproof anti-duplicate guard. Before we ever RE-SEND a chat, make sure the previous
+    transfer is not still completing: Quick Share writes the received file only when the transfer
+    FINISHES, so a slow big-media transfer can be declared 'failed' and then land a moment later -
+    re-sending it is what creates duplicate (1)(2)(3).zip files.
+
+    We watch BOTH the save folder and the phone for up to `timeout`s:
+      - a NEW, size-stable, VALID zip -> accept it (the transfer succeeded; do NOT re-send);
+      - a file still GROWING, or the phone still showing Sending/%/progress -> keep waiting;
+      - genuinely quiet (no file, no progress) for a while -> give up so a real failure is retried.
+    Returns (path, bytes, sha256) or None."""
+    if not save_dir:
+        return None
+    start = time.time()
+    last_sizes = {}
+    last_activity = time.time()
+    next_phone = 0.0
+    quiet_grace = 18.0
+    while time.time() - start < timeout:
+        if outer_stop is not None and outer_stop.is_set():
+            return None
+        try:
+            now = bt.snapshot(save_dir)
+        except Exception:
+            now = {}
+        growing = False
+        for n, s in now.items():
+            if s <= 0 or (n in before and before.get(n) == s):
+                continue                                   # unchanged pre-existing file
+            if last_sizes.get(n) != s:
+                growing = True                             # size moved since last poll -> arriving
+                last_sizes[n] = s
+                last_activity = time.time()
+                continue
+            # stable since last poll -> is it a complete, valid export?
+            p = os.path.join(save_dir, n)
+            try:
+                if (not n.lower().endswith(".zip")) or bt.zip_media_info(p).get("ok"):
+                    time.sleep(0.6)
+                    return p, os.path.getsize(p), bt.sha256(p)
+            except OSError:
+                pass
+        if time.time() >= next_phone:                      # is the phone still transferring?
+            next_phone = time.time() + 3.0
+            try:
+                for nd in _nodes(adb):
+                    for f in (nd.get("text"), nd.get("desc")):
+                        if not f:
+                            continue
+                        fl = f.lower()
+                        if ("sending" in fl or "receiving" in fl or "transferring" in fl
+                                or "waiting for" in fl or "connecting" in fl or "preparing" in fl
+                                or re.search(r"\d+\s*%", fl)):
+                            last_activity = time.time()
+            except Exception:
+                pass
+        if not growing and (time.time() - last_activity) > quiet_grace:
+            return None                                    # nothing arriving, phone idle -> real fail
+        time.sleep(2.0)
+    return None
 
 
 def export_with_retry(adb, case, size, reopen, emit_log, outer_stop, on_runner,
                       pc_name, save_dir, ensure_list):
     """Run export_and_send, retrying the whole thing on a transient Quick Share failure
     (fail-transfer/noshare/pcpick). `reopen()` re-opens the chat from the list and returns
-    True, or False if the chat row can't be found. Returns (status, path, digest, media)."""
+    True, or False if the chat row can't be found. Returns (status, path, digest, media).
+
+    Before EVERY re-send we re-check the save folder for a file that arrived late: Quick Share
+    writes the received file only when the transfer finishes, so a slow transfer can time out and
+    then land - re-sending it would create a duplicate zip. If a new file is already here, we accept
+    it instead of re-sending."""
+    base_before = bt.snapshot(save_dir) if save_dir else {}
     status, path, digest, media = "fail-notfound", None, None, ""
     for attempt in range(1 + SHARE_RETRIES):
         if not reopen():
@@ -699,6 +922,25 @@ def export_with_retry(adb, case, size, reopen, emit_log, outer_stop, on_runner,
                 or (outer_stop is not None and outer_stop.is_set())
                 or attempt >= SHARE_RETRIES):
             return status, path, digest, media
+        # FOOLPROOF anti-duplicate: never re-send while the previous (possibly slow) transfer could
+        # still be completing. Wait and watch the folder + phone; if a valid file lands, accept it.
+        emit_log("verifying the previous transfer really failed before re-sending (anti-duplicate)...")
+        late = _await_late_file(adb, save_dir, base_before, emit_log, outer_stop)
+        if late:
+            lp, lb, ld = late
+            label = media or "with media"
+            try:
+                info = bt.zip_media_info(lp)
+                if info.get("ok"):
+                    label = info["label"]
+            except Exception:
+                pass
+            emit_log(f"received {Path(lp).name} ({lb} bytes, {label}) - arrived late; NOT re-sending (no duplicate)")
+            try:
+                case.record_file(Path(lp), f"whatsapp export ({label}) via Quick Share")
+            except Exception:
+                pass
+            return "ok", lp, ld, label
         emit_log(f"{status} - retrying (attempt {attempt + 2}/{1 + SHARE_RETRIES})")
         ensure_list()
     return status, path, digest, media
@@ -770,14 +1012,24 @@ class WhatsAppBatch(threading.Thread):
 
     def _wait_device(self, timeout=180):
         end = time.time() + timeout
+        said = None
         while time.time() < end and not self._stop.is_set():
             if self._device_ready():
+                if said is not None:
+                    self.emit("log", "device is ready")
                 return True
+            # explain WHY we're waiting (so "stuck in initialisation" is never a mystery)
+            msg = _device_wait_reason(self.adb.path)
+            if msg != said:
+                self.emit("log", msg)
+                said = msg
             time.sleep(2)
         return False
 
     def _ensure_list(self):
         for _ in range(8):
+            if dismiss_anr(self.adb):                 # clear an ANR dialog that blocks the list
+                time.sleep(1.2)
             st = on_chat_list(self.adb)
             if st:
                 return True
@@ -825,6 +1077,8 @@ class WhatsAppBatch(threading.Thread):
             if not self._device_ready() and not self._wait_device():
                 self.emit("finished", {"last": None, "results": []}); return
             keep_awake(self.adb, True)
+            pc_keep_awake(True)                   # keep THIS PC awake for the whole run (like the phone)
+            self.emit("log", "PC sleep/screen-off suppressed for the duration of the run")
             if not Path(self.save_dir).is_dir():
                 self.emit("log", f"WARNING: save folder '{self.save_dir}' does not exist - "
                                  "received files won't be detected. Point Quick Share there.")
@@ -882,6 +1136,11 @@ class WhatsAppBatch(threading.Thread):
                     except core.AdbError:
                         pass
         finally:
+            pc_keep_awake(False)       # release the PC sleep/display lock
+            try:
+                keep_awake(self.adb, False)
+            except Exception:
+                pass
             self._write_csv()          # guarantee the final state (incl. a last failure) is saved
             self.emit("finished", {"last": self.last_done, "results": self.results})
 
@@ -1042,14 +1301,24 @@ class RollingBatch(threading.Thread):
 
     def _wait_device(self, timeout=180):
         end = time.time() + timeout
+        said = None
         while time.time() < end and not self._stop.is_set():
             if self._device_ready():
+                if said is not None:
+                    self.emit("log", "device is ready")
                 return True
+            # explain WHY we're waiting (so "stuck in initialisation" is never a mystery)
+            msg = _device_wait_reason(self.adb.path)
+            if msg != said:
+                self.emit("log", msg)
+                said = msg
             time.sleep(2)
         return False
 
     def _ensure_list(self):
         for _ in range(8):
+            if dismiss_anr(self.adb):                 # clear an ANR dialog that blocks the list
+                time.sleep(1.2)
             st = on_chat_list(self.adb)
             if st:
                 return True
@@ -1215,6 +1484,8 @@ class RollingBatch(threading.Thread):
             except Exception:
                 self._orig_sot = None
             keep_awake(self.adb, True)
+            pc_keep_awake(True)                   # keep THIS PC awake for the whole run (like the phone)
+            self.emit("log", "PC sleep/screen-off suppressed for the duration of the run")
             if not Path(self.save_dir).is_dir():
                 self.emit("log", f"WARNING: save folder '{self.save_dir}' does not exist - "
                                  "received files won't be detected. Point Quick Share there.")
@@ -1245,7 +1516,9 @@ class RollingBatch(threading.Thread):
                     self.files[nm] = fl.get(nm, ("", "", ""))
                     self.times[nm] = tm.get(nm, "")
                     if self.status[nm] == "ok":
-                        self._done_fps.add(_fingerprint(nm))   # don't re-export a variant of a done chat
+                        fp = _fingerprint(nm)
+                        if fp:
+                            self._done_fps.add(fp)             # don't re-export a variant of a done chat
                     self.emit("discover", nm)
                     self.emit("row", nm, self.status[nm])
                 done = sum(1 for nm in od if self.status.get(nm) == "ok")
@@ -1283,6 +1556,11 @@ class RollingBatch(threading.Thread):
                 if loops % 15 == 0:
                     keep_awake(self.adb, True)       # periodically re-assert (stay-on can lapse)
                 try:
+                    # if WhatsApp threw an "isn't responding" (ANR) dialog, tap WAIT and carry on
+                    # instead of stalling behind it.
+                    if dismiss_anr(self.adb):
+                        self.emit("log", "handled a 'WhatsApp isn't responding' dialog (tapped Wait)")
+                        time.sleep(1.5)
                     # a mega-chat's export can finish LATE and pop the Android share sheet after we
                     # already moved on; it's unreadable so visible_chats can't see it. Detect the
                     # chooser by its foreground window and BACK out of it before doing anything.
@@ -1302,8 +1580,10 @@ class RollingBatch(threading.Thread):
                         if nm not in self.status:
                             # LOOP GUARD: if a chat we already FINISHED is read again with a slightly
                             # different name (happens under load), its fingerprint matches -> skip it
-                            # as a duplicate instead of exporting it again.
-                            if _fingerprint(nm) in self._done_fps:
+                            # as a duplicate instead of exporting it again. A "" fingerprint (an
+                            # all-symbol/emoji name) is NEVER treated as a duplicate.
+                            fp = _fingerprint(nm)
+                            if fp and fp in self._done_fps:
                                 self.status[nm] = "skipped"; self.order.append(nm)
                                 self.emit("discover", nm); self.emit("row", nm, "skipped")
                                 self.emit("log", f"duplicate of a finished chat - skipping: {nm!r}")
@@ -1323,7 +1603,9 @@ class RollingBatch(threading.Thread):
                         self.emit("row", name, "running")
                         st = self._export_one(name)
                         self.status[name] = st
-                        self._done_fps.add(_fingerprint(name))   # finished -> never re-export a variant
+                        fp = _fingerprint(name)
+                        if fp:
+                            self._done_fps.add(fp)               # finished -> never re-export a variant
                         self.emit("row", name, st)
                         if st == "ok":
                             exported += 1
@@ -1363,6 +1645,7 @@ class RollingBatch(threading.Thread):
                     except core.AdbError:
                         pass
         finally:
+            pc_keep_awake(False)                  # release the PC sleep/display lock
             keep_awake(self.adb, False)
             try:                                  # restore the phone's original screen-off timeout
                 if getattr(self, "_orig_sot", None) and self._orig_sot.isdigit():
