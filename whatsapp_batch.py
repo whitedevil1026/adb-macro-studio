@@ -704,16 +704,16 @@ def export_and_send(adb, case, size, emit_log=lambda m: None, outer_stop=None,
     # when there's no file AND no visible progress for a while.
     emit_log(f"sent to {pc_name}; waiting for the file to arrive...")
     phone = {"next": 0.0, "sent": False, "failed": False, "completed": False,
-             "active_at": 0.0, "completed_at": 0.0}
+             "active_at": 0.0, "final_at": 0.0}
 
     def _abort():
         # returns "stop" (user stop -> bail now) or None. We DO NOT fast-fail on a phone 'Failed':
-        # Quick Share writes the received file atomically at the END of the transfer, so no file is
-        # visible mid-flight, and the phone's screen lists EVERY nearby device - an early/stray
-        # 'Failed' (often from a DIFFERENT device) used to trip a retry that re-sent the chat and
-        # created duplicate (1)(2)(3).zip files. The received file + 'Completed' + the activity-aware
-        # wait are the verdict. We READ 'Completed'/'Done' (-> fast definitive success), track
-        # in-progress signals (Sending/%/Receiving... -> active_at), and log 'Sent'/'Failed'.
+        # the phone's screen lists EVERY nearby device, so a stray 'Failed' (often from a DIFFERENT
+        # device) must never cancel/retry a transfer that actually succeeded. The received file is
+        # the final verdict; the phone screen tells us WHEN to keep waiting for it:
+        #   - 'Sent' / 'Completed' / 'Done' (-> final_at): the phone FINISHED the transfer, so the
+        #     file is imminent - wait for it, and NEVER re-send (that was the duplicate bug).
+        #   - 'Sending' / '%' / 'x MB/s' (-> active_at): still in flight, keep waiting (big files).
         if outer_stop is not None and outer_stop.is_set():
             return "stop"
         now = time.time()
@@ -724,8 +724,14 @@ def export_and_send(adb, case, size, emit_log=lambda m: None, outer_stop=None,
         if not phone["completed"] and (core.find_node(nodes, "Completed", "contains")
                                        or core.find_node(nodes, "Done", "exact")):
             phone["completed"] = True
-            phone["completed_at"] = now
-            emit_log("phone shows Quick Share 'Completed'")
+            if not phone["final_at"]:
+                phone["final_at"] = now
+            emit_log("phone shows Quick Share 'Completed' - waiting for the file")
+        if not phone["sent"] and core.find_node(nodes, "Sent", "contains"):
+            phone["sent"] = True
+            if not phone["final_at"]:
+                phone["final_at"] = now
+            emit_log("phone shows Quick Share 'Sent' - the file is on its way, waiting for it")
         # transfer-in-progress signals -> the transfer is ALIVE, keep waiting (big files are slow)
         for n in nodes:
             for f in (n.get("text"), n.get("desc")):
@@ -740,9 +746,6 @@ def export_and_send(adb, case, size, emit_log=lambda m: None, outer_stop=None,
         if not phone["failed"] and core.find_node(nodes, "Failed", "contains"):
             phone["failed"] = True
             emit_log("phone screen shows a 'Failed' (ignored - the received file decides)")
-        if not phone["sent"] and core.find_node(nodes, "Sent", "contains"):
-            phone["sent"] = True
-            emit_log("phone shows Quick Share 'Sent' - finalising on PC")
         return None
 
     # activity-aware wait: a minimum "floor" (in case the transfer screen is unreadable so we can't
@@ -752,8 +755,8 @@ def export_and_send(adb, case, size, emit_log=lambda m: None, outer_stop=None,
     # BLIND (transfer screen unreadable): we can't see progress, so wait a longer minimum in case a
     # transfer is silently happening. READABLE: progress is visible, so the activity-extension below
     # covers any slow transfer and a short floor is enough - this keeps a genuine failure fast.
-    floor_until = time.time() + (90 if blind else 45)
-    hard_cap = time.time() + (600 if blind else 1200)
+    floor_until = time.time() + (120 if blind else 75)
+    hard_cap = time.time() + (900 if blind else 1200)
     res = None
     while time.time() < hard_cap:
         if outer_stop is not None and outer_stop.is_set():
@@ -762,13 +765,14 @@ def export_and_send(adb, case, size, emit_log=lambda m: None, outer_stop=None,
                                    abort=_abort, confirm=lambda: phone["completed"])
         if res:
             break
-        if phone["completed"]:
-            # phone says done -> the file should land within seconds. Give it a short grace, then
-            # STOP (don't loop to the 10-min cap): 'Completed' with no file = wrong Save folder.
-            if time.time() - phone["completed_at"] < 45:
+        if phone["final_at"]:
+            # the phone FINISHED the transfer (Sent/Completed) -> the file is imminent; wait a
+            # generous grace for it to land, then STOP (don't loop to the cap): finished-but-no-file
+            # means the Save folder isn't where Quick Share saves.
+            if time.time() - phone["final_at"] < 120:
                 continue
             break
-        if time.time() - phone["active_at"] < 25:
+        if time.time() - phone["active_at"] < 30:
             continue                                   # transfer still showing progress -> wait on
         if time.time() < floor_until:
             continue                                   # can't see progress yet -> honour the floor
@@ -777,12 +781,12 @@ def export_and_send(adb, case, size, emit_log=lambda m: None, outer_stop=None,
     if not res:
         # the file never arrived AND the transfer stopped showing progress: a real failure (PC not
         # receiving / asleep / wrong save folder / transfer dropped). Retried.
-        if phone["completed"]:
-            # the phone SAYS it completed but nothing landed in save_dir -> almost always the Save
-            # folder isn't the real Quick Share destination. Retrying won't help; flag it loudly.
-            emit_log(f"WARNING: phone shows 'Completed' but no file appeared in '{save_dir}'. "
-                     "The Save folder is probably NOT where Quick Share saves - fix it to stop "
-                     "every transfer being counted as failed.")
+        if phone["final_at"]:
+            # the phone SAYS it finished (Sent/Completed) but nothing landed in save_dir -> almost
+            # always the Save folder isn't the real Quick Share destination. Retrying won't help.
+            emit_log(f"WARNING: phone reported the transfer finished but no file appeared in "
+                     f"'{save_dir}'. The Save folder is probably NOT where Quick Share saves - fix "
+                     "it to stop every transfer being counted as failed.")
         return ("fail-sent" if phone["failed"] else "fail-transfer"), None, None, media["mode"]
     path, nbytes, digest = res
     # VERIFY the received .zip actually opens and read its real contents (authoritative over the
@@ -852,7 +856,8 @@ def _await_late_file(adb, save_dir, before, emit_log, outer_stop, timeout=200):
     last_sizes = {}
     last_activity = time.time()
     next_phone = 0.0
-    quiet_grace = 18.0
+    quiet_grace = 30.0
+    finished_at = 0.0           # when the phone showed Sent/Completed (file imminent -> wait on)
     while time.time() - start < timeout:
         if outer_stop is not None and outer_stop.is_set():
             return None
@@ -877,7 +882,7 @@ def _await_late_file(adb, save_dir, before, emit_log, outer_stop, timeout=200):
                     return p, os.path.getsize(p), bt.sha256(p)
             except OSError:
                 pass
-        if time.time() >= next_phone:                      # is the phone still transferring?
+        if time.time() >= next_phone:                      # read the phone's transfer screen
             next_phone = time.time() + 3.0
             try:
                 for nd in _nodes(adb):
@@ -885,12 +890,21 @@ def _await_late_file(adb, save_dir, before, emit_log, outer_stop, timeout=200):
                         if not f:
                             continue
                         fl = f.lower()
-                        if ("sending" in fl or "receiving" in fl or "transferring" in fl
+                        # 'Sent'/'Completed'/'Done' = the phone FINISHED -> file imminent, wait on
+                        if "sent" in fl or "completed" in fl or fl.strip() == "done":
+                            last_activity = time.time()
+                            if not finished_at:
+                                finished_at = time.time()
+                        elif ("sending" in fl or "receiving" in fl or "transferring" in fl
                                 or "waiting for" in fl or "connecting" in fl or "preparing" in fl
                                 or re.search(r"\d+\s*%", fl)):
                             last_activity = time.time()
             except Exception:
                 pass
+        # once the phone has reported finished, keep waiting the full window for the file to land
+        if finished_at:
+            time.sleep(2.0)
+            continue
         if not growing and (time.time() - last_activity) > quiet_grace:
             return None                                    # nothing arriving, phone idle -> real fail
         time.sleep(2.0)
