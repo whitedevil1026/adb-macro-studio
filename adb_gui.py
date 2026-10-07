@@ -40,6 +40,7 @@ from adb_core import (
 )
 import queue as _queue
 import whatsapp_batch as wb
+import contacts_extract as ce
 
 BASE = Path(__file__).resolve().parent
 MACRO_DIR = BASE / "macros"
@@ -882,6 +883,26 @@ class App:
         self._log(f"case folder: {self.case.dir}")
         self.refresh_macros()
         self._start_live()
+        self._extract_contacts_async()        # once ADB is ready: pull contacts + WhatsApp JIDs
+
+    def _extract_contacts_async(self):
+        """On connect, pull the phone's contacts and the WhatsApp contacts (with JID) into the case
+        folder, in the background so it never blocks the UI. Non-fatal."""
+        adb, case = self.adb, self.case
+        if not adb or not case:
+            return
+
+        def work():
+            try:
+                # _adblog is the thread-safe logger (queues to the UI pump); never touch widgets here
+                self._adblog("contacts: starting extraction (phone contacts + WhatsApp JIDs)...")
+                res = ce.extract_contacts(adb, case.dir, log=self._adblog, case=case)
+                self._adblog(f"contacts: done - {res['contacts']} phone contacts, "
+                             f"{res['whatsapp']} WhatsApp contacts. Saved in the case folder.")
+            except Exception as e:
+                self._adblog(f"contacts: extraction error (non-fatal): {e!r}")
+
+        threading.Thread(target=work, daemon=True).start()
 
     # ---- live view -------------------------------------------------------
     def _start_live(self):
