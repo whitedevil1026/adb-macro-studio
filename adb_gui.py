@@ -25,10 +25,11 @@ Needs: adb on PATH (or set the ADB_PATH environment variable), Python 3 with tki
 from __future__ import annotations
 
 import base64
+import os
 import queue
 import threading
 import tkinter as tk
-from tkinter import ttk, messagebox, simpledialog
+from tkinter import ttk, messagebox, simpledialog, filedialog
 from pathlib import Path
 
 import adb_core as core
@@ -731,6 +732,8 @@ class App:
         self.dev_box.pack(side="left", padx=4)
         ttk.Button(top, text="Refresh", command=self.refresh_devices).pack(side="left")
         ttk.Button(top, text="Connect", command=self.connect).pack(side="left", padx=4)
+        ttk.Button(top, text="Contacts + WhatsApp JIDs → folder...",
+                   command=self.extract_contacts_to_folder).pack(side="left", padx=4)
         self.info_lbl = ttk.Label(top, text="not connected")
         self.info_lbl.pack(side="left", padx=10)
         self.live_var = tk.BooleanVar(value=True)
@@ -884,6 +887,28 @@ class App:
         self.refresh_macros()
         self._start_live()
         self._extract_contacts_async()        # once ADB is ready: pull contacts + WhatsApp JIDs
+
+    def extract_contacts_to_folder(self):
+        """Button: pick a folder, then extract contacts.csv + whatsapp_contacts.csv into it."""
+        if not self.adb:
+            messagebox.showinfo("No device", "Connect a device first.")
+            return
+        folder = filedialog.askdirectory(title="Choose a folder for the 2 contact files")
+        if not folder:
+            return
+        adb = self.adb
+
+        def work():
+            try:
+                self._adblog(f"contacts: extracting into {folder} ...")
+                res = ce.extract_contacts(adb, folder, log=self._adblog)
+                names = ", ".join(os.path.basename(f) for f in res["files"])
+                self._adblog(f"contacts: done - {res['contacts']} phone contacts, "
+                             f"{res['whatsapp']} WhatsApp contacts -> {names or '(no files)'}")
+            except Exception as e:
+                self._adblog(f"contacts: extraction error: {e!r}")
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _extract_contacts_async(self):
         """On connect, pull the phone's contacts and the WhatsApp contacts (with JID) into the case

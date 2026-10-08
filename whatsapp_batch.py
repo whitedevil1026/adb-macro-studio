@@ -719,7 +719,10 @@ def export_and_send(adb, case, size, emit_log=lambda m: None, outer_stop=None,
         now = time.time()
         if now < phone["next"]:
             return None
-        phone["next"] = now + 3.0                       # throttle phone reads
+        phone["next"] = now + 6.0                       # throttle phone reads (less uiautomator load
+        #                                                 during the transfer -> Quick Share runs faster
+        #                                                 and WhatsApp ANRs less; the PC file is the
+        #                                                 real signal and is polled far more often)
         nodes = _nodes(adb)
         if not phone["completed"] and (core.find_node(nodes, "Completed", "contains")
                                        or core.find_node(nodes, "Done", "exact")):
@@ -883,7 +886,7 @@ def _await_late_file(adb, save_dir, before, emit_log, outer_stop, timeout=200):
             except OSError:
                 pass
         if time.time() >= next_phone:                      # read the phone's transfer screen
-            next_phone = time.time() + 3.0
+            next_phone = time.time() + 6.0                 # light phone polling -> faster transfer
             try:
                 for nd in _nodes(adb):
                     for f in (nd.get("text"), nd.get("desc")):
