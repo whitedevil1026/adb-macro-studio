@@ -338,6 +338,7 @@ class BatchExportWindow(tk.Toplevel):
         self.batch = None
         self.scanning = False
         self.pause_evt = threading.Event()      # set = paused (shared by scan + batch)
+        self._running_name = None               # chat currently being exported (for status display)
         self.scan_stop = threading.Event()
 
         top = ttk.Frame(self, padding=6)
@@ -460,9 +461,19 @@ class BatchExportWindow(tk.Toplevel):
         if self.pause_evt.is_set():
             self.pause_evt.clear()
             self.pause_btn.config(text="Pause")
+            run = getattr(self, "_running_name", None)
+            self.status_lbl.config(text=(f"▶ RUNNING: {run}" if run else "▶ running"),
+                                   foreground="#06c")
+            self._log("RESUMED")
         else:
             self.pause_evt.set()
             self.pause_btn.config(text="Resume")
+            run = getattr(self, "_running_name", None)
+            self.status_lbl.config(
+                text=(f"⏸ PAUSED (holding at '{run}')" if run else "⏸ PAUSED"),
+                foreground="#c60")
+            self._log("PAUSE pressed - holding after the current step "
+                      "(a transfer in flight finishes first)")
 
     def resume_pending(self):
         pend = [iid for iid in self.tree.get_children()
@@ -483,9 +494,30 @@ class BatchExportWindow(tk.Toplevel):
             pass
         p = filedialog.askopenfilename(parent=self, title="Pick a prior exported_chats.csv to resume from",
                                        initialdir=init, filetypes=[("CSV", "*.csv"), ("All files", "*.*")])
-        if p:
-            self.resume_path = p
-            self.resume_lbl.config(text="resume: " + Path(p).name, foreground="#0a7")
+        if not p:
+            return
+        # LOAD the CSV now so its results are visible in the list and a start-chat can be selected.
+        # This works for a CSV from ANOTHER instance/PC too - we load whatever chats+statuses it has.
+        try:
+            st, od, fl, tm = wb.load_progress(p)
+        except Exception as e:
+            messagebox.showerror("Resume load failed", f"Could not read:\n{p}\n\n{e}", parent=self)
+            return
+        self.resume_path = p
+        self.resume_lbl.config(text="resume: " + Path(p).name, foreground="#0a7")
+        self.tree.delete(*self.tree.get_children())
+        self.row_of.clear()
+        self.order = []
+        for nm in od:
+            status = st.get(nm) or "pending"
+            iid = self.tree.insert("", "end", values=(nm, status), tags=(self._tag(status),))
+            self.row_of[nm] = iid
+            self.order.append(nm)
+        done = sum(1 for nm in od if st.get(nm) == "ok")
+        self.status_lbl.config(
+            text=f"loaded {len(od)} from CSV ({done} already ok) - select a chat, then "
+                 "'Start from selected'")
+        self._log(f"resume CSV loaded: {len(od)} chats, {done} already ok  <-  {p}")
 
     def _clear_resume(self):
         self.resume_path = None
@@ -640,6 +672,10 @@ class BatchExportWindow(tk.Toplevel):
                         self.tree.item(iid, tags=(self._tag(status),))
                         self.tree.see(iid)
                     self.progress_lbl.config(text=f"{name}  ->  {status}")
+                    if status == "running":
+                        self._running_name = name
+                        if not self.pause_evt.is_set():
+                            self.status_lbl.config(text=f"▶ RUNNING: {name}", foreground="#06c")
                 elif kind == "progress":
                     i, total, name, status = a
                     self.progress_lbl.config(text=f"{i}/{total}: {name}  ->  {status}")
@@ -654,7 +690,18 @@ class BatchExportWindow(tk.Toplevel):
                     summ = a[0]
                     if "csv" in summ:                      # rolling auto run
                         self.progress_lbl.config(text=f"done - {summ['exported']}/{summ['total']} exported")
-                        self._log(f"FINISHED (auto): {summ['exported']}/{summ['total']} exported. CSV: {summ['csv']}")
+                        if summ.get("stopped"):
+                            where = summ.get("last") or "?"
+                            self.status_lbl.config(text=f"■ STOPPED at '{where}' "
+                                                   f"({summ.get('pending', 0)} still pending)",
+                                                   foreground="#c60")
+                            self._log(f"STOPPED by user at '{where}'. {summ['exported']} exported, "
+                                      f"{summ.get('pending', 0)} still pending. CSV: {summ['csv']}")
+                        else:
+                            self.status_lbl.config(text=f"✓ DONE - {summ['exported']}/{summ['total']} "
+                                                   "exported", foreground="#0a7")
+                            self._log(f"FINISHED (auto): {summ['exported']}/{summ['total']} exported. "
+                                      f"CSV: {summ['csv']}")
                     else:
                         results = summ.get("results", [])
                         ok = sum(1 for _, s in results if s == "ok")
