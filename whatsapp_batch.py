@@ -619,9 +619,23 @@ def _back_to_list(adb, tries=14):
     return bool(on_chat_list(adb))
 
 
+def _pause_wait(pause, stop=None):
+    """Block while the pause event is set. Returns the seconds spent paused, so a caller can extend
+    a transfer deadline by that much (paused time must not count against the transfer). Returns
+    immediately when not paused, or bails if a stop is requested."""
+    if pause is None or not pause.is_set():
+        return 0.0
+    t0 = time.time()
+    while pause.is_set():
+        if stop is not None and stop.is_set():
+            break
+        time.sleep(0.2)
+    return time.time() - t0
+
+
 def export_and_send(adb, case, size, emit_log=lambda m: None, outer_stop=None,
                     on_runner=None, pc_name=PC_NAME, save_dir=SAVE_DIR, auto_accept=True,
-                    deadline=None):
+                    deadline=None, pause=None):
     """Open chat is assumed already. Export (media -> fallback), send via Quick Share to
     `pc_name`, wait for the file on the PC, hash it, then navigate back to the chat list.
     `deadline` (epoch seconds) caps the time to reach the 'sent' point; if it's blown we give
@@ -636,6 +650,7 @@ def export_and_send(adb, case, size, emit_log=lambda m: None, outer_stop=None,
     # the flow ATTEMPTS with-media first; _do_export downgrades media['mode'] to "without media"
     # only if WhatsApp rejects the media export.
     media = {"mode": "with media"}
+    _pause_wait(pause, outer_stop)                   # honour Pause before touching the phone
     reason = _do_export(adb, media, emit_log, outer_stop, _left)
     if reason == "stopped":
         return "stopped", None, None, media["mode"]
@@ -762,6 +777,10 @@ def export_and_send(adb, case, size, emit_log=lambda m: None, outer_stop=None,
     hard_cap = time.time() + (900 if blind else 1200)
     res = None
     while time.time() < hard_cap:
+        paused = _pause_wait(pause, outer_stop)      # Pause mid-transfer: freeze polling, don't fail
+        if paused:
+            floor_until += paused
+            hard_cap += paused                       # paused time doesn't count against the transfer
         if outer_stop is not None and outer_stop.is_set():
             break
         res = bt.wait_for_new_file(save_dir, before, timeout=30,
@@ -915,7 +934,7 @@ def _await_late_file(adb, save_dir, before, emit_log, outer_stop, timeout=200):
 
 
 def export_with_retry(adb, case, size, reopen, emit_log, outer_stop, on_runner,
-                      pc_name, save_dir, ensure_list):
+                      pc_name, save_dir, ensure_list, pause=None):
     """Run export_and_send, retrying the whole thing on a transient Quick Share failure
     (fail-transfer/noshare/pcpick). `reopen()` re-opens the chat from the list and returns
     True, or False if the chat row can't be found. Returns (status, path, digest, media).
@@ -927,6 +946,7 @@ def export_with_retry(adb, case, size, reopen, emit_log, outer_stop, on_runner,
     base_before = bt.snapshot(save_dir) if save_dir else {}
     status, path, digest, media = "fail-notfound", None, None, ""
     for attempt in range(1 + SHARE_RETRIES):
+        _pause_wait(pause, outer_stop)                    # honour Pause between attempts
         if not reopen():
             if attempt == 0:
                 return "fail-notfound", None, None, ""    # genuinely not on screen to begin with
@@ -937,7 +957,7 @@ def export_with_retry(adb, case, size, reopen, emit_log, outer_stop, on_runner,
             return status, path, digest, media
         status, path, digest, media = export_and_send(
             adb, case, size, emit_log=emit_log, outer_stop=outer_stop, on_runner=on_runner,
-            pc_name=pc_name, save_dir=save_dir, deadline=time.time() + MAX_SEND_SECONDS)
+            pc_name=pc_name, save_dir=save_dir, deadline=time.time() + MAX_SEND_SECONDS, pause=pause)
         if (status not in SHARE_RETRY_STATUSES
                 or (outer_stop is not None and outer_stop.is_set())
                 or attempt >= SHARE_RETRIES):
@@ -1130,7 +1150,8 @@ class WhatsAppBatch(threading.Thread):
                     status, path, digest, media = export_with_retry(
                         self.adb, self.case, self.size, reopen,
                         lambda m: self.emit("log", f"   {m}"),
-                        self._stop, self._set_runner, self.pc_name, self.save_dir, self._ensure_list)
+                        self._stop, self._set_runner, self.pc_name, self.save_dir, self._ensure_list,
+                        pause=self._pause)
                     if status == "fail-notfound":
                         self.emit("progress", i, total, name, "fail-notfound")
                         self.results.append((name, "fail-notfound")); continue
@@ -1289,6 +1310,7 @@ class RollingBatch(threading.Thread):
         self._stop = threading.Event()
         self._pause = pause or threading.Event()
         self._runner = None       # current inner export runner
+        self._last_running = None  # the chat we last started exporting (for "stopped where" status)
         self.status = {}          # name -> status
         self.files = {}           # name -> (filename, sha256, media)
         self.times = {}           # name -> ISO time the row became terminal
@@ -1491,7 +1513,8 @@ class RollingBatch(threading.Thread):
         status, path, digest, media = export_with_retry(
             self.adb, self.case, self.size, reopen,
             lambda m: self.emit("log", f"   {m}"),
-            self._stop, self._set_runner, self.pc_name, self.save_dir, self._ensure_list)
+            self._stop, self._set_runner, self.pc_name, self.save_dir, self._ensure_list,
+            pause=self._pause)
         # record the media mode that was chosen even if the send later failed
         # (blank only if we never reached the with/without-media choice)
         self.files[name] = (Path(path).name if path else "", digest or "", media)
@@ -1630,6 +1653,7 @@ class RollingBatch(threading.Thread):
                     if todo:
                         stale = 0
                         name = todo[0]
+                        self._last_running = name
                         self.emit("row", name, "running")
                         st = self._export_one(name)
                         self.status[name] = st
@@ -1697,4 +1721,7 @@ class RollingBatch(threading.Thread):
             except Exception:
                 pass
             self._write_csv()
-            self.emit("finished", {"exported": exported, "total": len(self.order), "csv": self.csv_path})
+            pending_left = sum(1 for s in self.status.values() if s in ("pending", "running"))
+            self.emit("finished", {"exported": exported, "total": len(self.order),
+                                   "csv": self.csv_path, "stopped": self._stop.is_set(),
+                                   "last": self._last_running, "pending": pending_left})
