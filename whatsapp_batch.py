@@ -119,8 +119,19 @@ def _nodes(adb):
 _NAME_MARKS = "‎‏‪‫‬⁦⁧⁨⁩﻿"
 
 
+_NAME_MARK_RE = re.compile("[​‎‏‪-‮⁦-⁩﻿]")
+_WS_RE = re.compile(r"\s+", re.UNICODE)
+
+
 def _norm_name(s):
-    return (s or "").strip().strip(_NAME_MARKS).strip()
+    """Stable identity for a chat name across screen reads. Removes invisible direction/format marks
+    ANYWHERE in the name (not just at the ends), turns every kind of whitespace (incl. NBSP) into a
+    single space, and Unicode-normalizes (NFC). ZWJ/ZWNJ (U+200D/U+200C) are KEPT - Indic scripts and
+    emoji need them. Without this the same chat could read as two different names between dumps."""
+    import unicodedata
+    s = unicodedata.normalize("NFC", s or "")
+    s = _NAME_MARK_RE.sub("", s)
+    return _WS_RE.sub(" ", s).strip()
 
 
 def _fingerprint(s):
@@ -136,24 +147,44 @@ def _fingerprint(s):
     return re.sub(r"[\W_]+", "", _norm_name(s).lower(), flags=re.UNICODE)
 
 
+def _row_name(n):
+    """A chat row's name: its text, or its content-desc when the text is empty (some WhatsApp
+    builds/rows expose the name only there - those chats used to be invisible to the tool)."""
+    return _norm_name(n.get("text") or n.get("desc") or "")
+
+
+def _chat_rows(nodes):
+    """Chat-name nodes on screen as dicts {name, node, full}, top -> bottom. `full` is False for a
+    row CLIPPED at the top/bottom edge (uiautomator reports clipped, visible bounds): tapping the
+    centre of a half-hidden row can land on the bottom navigation bar instead of the chat."""
+    rows = [n for n in nodes if n["id"].endswith(CONTACT_ID) and _row_name(n)]
+    if not rows:
+        return []
+    hmax = max(n["bounds"][3] - n["bounds"][1] for n in rows)
+    out = [{"name": _row_name(n), "node": n,
+            "full": (n["bounds"][3] - n["bounds"][1]) >= 0.75 * hmax} for n in rows]
+    return sorted(out, key=lambda r: r["node"]["bounds"][1])
+
+
 def visible_chats(adb):
     """List of (y, name) for chat rows currently on screen, top -> bottom. Names are normalised
     (whitespace + invisible direction marks stripped) for stable de-duplication."""
-    rows = []
-    for n in _nodes(adb):
-        if n["id"].endswith(CONTACT_ID):
-            nm = _norm_name(n["text"])
-            if nm:
-                rows.append((n["bounds"][1], nm))
-    return sorted(rows)
+    return [(r["node"]["bounds"][1], r["name"]) for r in _chat_rows(_nodes(adb))]
+
+
+def fully_visible_chats(adb):
+    """Names of the rows that are NOT clipped at a screen edge - the only ones safe to tap."""
+    return {r["name"] for r in _chat_rows(_nodes(adb)) if r["full"]}
 
 
 def _find_chat_node(adb, name):
+    """The on-screen node for `name`, preferring a fully visible (un-clipped) row."""
     key = _norm_name(name).lower()
-    for n in _nodes(adb):
-        if n["id"].endswith(CONTACT_ID) and _norm_name(n["text"]).lower() == key:
-            return n
-    return None
+    hits = [r for r in _chat_rows(_nodes(adb)) if r["name"].lower() == key]
+    if not hits:
+        return None
+    hits.sort(key=lambda r: not r["full"])          # full rows first
+    return hits[0]["node"]
 
 
 def on_chat_list(adb):
@@ -169,8 +200,7 @@ def on_chat_list(adb):
         return True
     # robust fallback: several chat-name rows on screen means we're on the list, even if the
     # search-hint text differs by WhatsApp version/locale (an open chat shows no such rows).
-    rows = [n for n in nodes if n["id"].endswith(CONTACT_ID) and n["text"].strip()]
-    return len(rows) >= 2
+    return len(_chat_rows(nodes)) >= 2
 
 
 def keep_awake(adb, on=True):
@@ -951,8 +981,198 @@ def _await_late_file(adb, save_dir, before, emit_log, outer_stop, timeout=200):
     return None
 
 
+# ----------------------------------------------------------------- adb-pull transport
+# The structural fix for the Quick Share problems. Quick Share gives NO ground truth: the PC file is
+# written atomically at the end (nothing visible mid-flight), the phone's screen lists every nearby
+# device, and over Bluetooth it is slow - so "did it arrive?" had to be INFERRED from timing, which
+# caused the false fails, the retries and the duplicates. Here we instead SAVE the export to the
+# phone's own storage (share sheet -> "Save to Files"/"My Files"/"Files") and `adb pull` the EXACT
+# file over USB: deterministic, fast, no nearby devices, no guessing.
+PHONE_SAVE_GLOBS = ("/sdcard/Download/*.zip", "/sdcard/Documents/*.zip", "/sdcard/*.zip")
+SAVE_TARGET_TEXTS = ("Save to Files", "Save to device", "Save to Device", "Save to phone",
+                     "My Files", "Files")
+SAVE_BUTTON_TEXTS = ("SAVE", "Save", "Save here", "SAVE HERE", "Done", "DONE")
+
+
+def _phone_zips(adb):
+    """{remote_path: size} for .zip files in the phone folders a 'Save to Files' lands in. Sent as
+    ONE device-side command string, so the DEVICE shell expands the globs and handles the quoting
+    (passing pieces as separate args is what mangles `adb shell` arguments)."""
+    cmd = "stat -c '%s|%n' " + " ".join(PHONE_SAVE_GLOBS) + " 2>/dev/null"
+    try:
+        out = adb.shell(cmd, quiet=True) or ""
+    except Exception:
+        return {}
+    found = {}
+    for line in out.splitlines():
+        line = line.strip()
+        if "|" not in line:
+            continue
+        sz, path = line.split("|", 1)
+        if sz.isdigit() and path.lower().endswith(".zip"):
+            found[path] = int(sz)
+    return found
+
+
+def _await_phone_zip(adb, before, timeout, outer_stop=None, pause=None):
+    """Wait for a NEW (or changed) .zip on the phone vs `before`, and return (path, size) once its
+    size is stable across two polls (fully written). Pause-aware; None on timeout/stop."""
+    end = time.time() + timeout
+    last = {}
+    while time.time() < end:
+        end += _pause_wait(pause, outer_stop)
+        if outer_stop is not None and outer_stop.is_set():
+            return None
+        new = {p: s for p, s in _phone_zips(adb).items() if s > 0 and before.get(p) != s}
+        for p, s in new.items():
+            if last.get(p) == s:
+                return p, s
+        last = new
+        time.sleep(1.5)
+    return None
+
+
+def _pull_unique(adb, remote, pull_dir):
+    """`adb pull` the phone file into pull_dir WITHOUT ever overwriting an existing file (evidence):
+    pull into a private .incoming folder, then move to a free name ('name (1).zip', ...)."""
+    os.makedirs(pull_dir, exist_ok=True)
+    inc = os.path.join(pull_dir, ".incoming")
+    os.makedirs(inc, exist_ok=True)
+    name = remote.rsplit("/", 1)[-1]
+    tmp = os.path.join(inc, name)
+    if os.path.exists(tmp):
+        os.remove(tmp)
+    adb.pull(remote, Path(inc))
+    if not os.path.isfile(tmp):
+        return None
+    base, ext = os.path.splitext(name)
+    dest, n = os.path.join(pull_dir, name), 1
+    while os.path.exists(dest):
+        dest = os.path.join(pull_dir, f"{base} ({n}){ext}")
+        n += 1
+    os.replace(tmp, dest)
+    return dest
+
+
+def _learn_tap(adb, size, outer_stop, timeout=90):
+    """Wait for the USER to tap the phone once and return its (x, y). Their tap performs the action
+    for real AND teaches us where it is, so the next chats can tap it automatically."""
+    got, ev = {}, threading.Event()
+
+    def on_g(g):
+        if g.get("type") == "tap":
+            got["xy"] = [g["x"], g["y"]]
+            ev.set()
+    rec = core.TouchRecorder(adb, size[0], size[1], on_g, lambda m: None)
+    try:
+        rec.start()
+    except Exception:
+        return None
+    try:
+        end = time.time() + timeout
+        while time.time() < end and not ev.is_set():
+            if outer_stop is not None and outer_stop.is_set():
+                return None
+            time.sleep(0.2)
+    finally:
+        rec.stop()
+    return got.get("xy")
+
+
+def _tap_learned(adb, key, slot, texts, prompt, emit_log, outer_stop, size, read_secs):
+    """Tap a target found by TEXT (and remember its position), else by its remembered position,
+    else ask the user to tap it once and learn it. Returns True when the target was tapped."""
+    cached = _COORDS.get(key, {})
+    if not (on_share_sheet(adb) and cached.get(slot)):          # chooser unreadable -> skip reading
+        end = time.time() + read_secs
+        while time.time() < end:
+            if outer_stop is not None and outer_stop.is_set():
+                return False
+            nodes = _nodes(adb)
+            for t in texts:
+                n = core.find_node(nodes, t, "exact")
+                if n:
+                    _COORDS.setdefault(key, {})[slot] = list(core.node_center(n)); _save_coords()
+                    adb.tap(*core.node_center(n)); time.sleep(1.5)
+                    return True
+            time.sleep(0.7)
+    if cached.get(slot):
+        emit_log(f"'{slot}' not readable - tapping its learned position")
+        adb.tap(*cached[slot]); time.sleep(1.5)
+        return True
+    emit_log(f"ACTION NEEDED: {prompt} (waiting 90s - it will be remembered for every next chat)")
+    xy = _learn_tap(adb, size, outer_stop)
+    if not xy:
+        return False
+    _COORDS.setdefault(key, {})[slot] = xy; _save_coords()
+    emit_log(f"learned '{slot}' position {xy}")
+    time.sleep(1.5)
+    return True
+
+
+def export_and_pull(adb, case, size, emit_log=lambda m: None, outer_stop=None, on_runner=None,
+                    pull_dir=SAVE_DIR, deadline=None, pause=None, **_ignored):
+    """Like export_and_send, but the transfer is: share sheet -> save to the PHONE -> adb pull.
+    Returns (status, local_path_or_None, sha256_or_None, media_label)."""
+    def _left():
+        return (deadline - time.time()) if deadline else 1e9
+    media = {"mode": "with media"}
+    _pause_wait(pause, outer_stop)
+    reason = _do_export(adb, media, emit_log, outer_stop, _left)
+    if reason == "stopped":
+        return "stopped", None, None, media["mode"]
+    if reason == "timeout":
+        _back_to_list(adb); return "fail-timeout", None, None, media["mode"]
+    if reason == "blocked":
+        _back_to_list(adb); return "blocked-privacy", None, None, media["mode"]
+    if reason != "done":
+        _back_to_list(adb); return "fail-export", None, None, media["mode"]
+
+    key = f"{size[0]}x{size[1]}"
+    before = _phone_zips(adb)                     # phone-side snapshot BEFORE saving
+    if not _tap_learned(adb, key, "save", SAVE_TARGET_TEXTS,
+                        "on the phone, tap your 'Save to Files' / 'My Files' share target",
+                        emit_log, outer_stop, size, read_secs=max(2, min(30, _left()))):
+        _back_to_list(adb); return "fail-nosave", None, None, media["mode"]
+
+    # some targets save immediately; others show a Save/Done dialog first
+    got = _await_phone_zip(adb, before, timeout=10, outer_stop=outer_stop, pause=pause)
+    if not got:
+        _tap_learned(adb, key, "savebtn", SAVE_BUTTON_TEXTS,
+                     "on the phone, tap the Save / Done button that confirms saving the file",
+                     emit_log, outer_stop, size, read_secs=12)
+        emit_log("saving the export on the phone...")
+        got = _await_phone_zip(adb, before, timeout=600, outer_stop=outer_stop, pause=pause)
+    _back_to_list(adb)
+    if not got:
+        return "fail-transfer", None, None, media["mode"]
+    remote, rsize = got
+    emit_log(f"saved on phone: {remote} ({rsize} bytes) - pulling over USB...")
+    try:
+        local = _pull_unique(adb, remote, pull_dir)
+    except Exception as e:
+        emit_log(f"adb pull failed: {e}")
+        local = None
+    if not local:
+        return "fail-transfer", None, None, media["mode"]
+    info = bt.zip_media_info(local)
+    if not info.get("ok"):
+        emit_log(f"pulled file is not a valid zip ({info.get('error')}) - retrying")
+        return "fail-transfer", None, None, media["mode"]
+    label = info["label"]
+    digest = bt.sha256(local)
+    emit_log(f"verified contents: {info['files']} files, {info['media']} media, "
+             f"{info['media_bytes']/1e6:.1f} MB media ({label})")
+    try:
+        case.record_file(Path(local), f"whatsapp export ({label}) via adb pull from {remote}")
+    except Exception:
+        pass
+    emit_log(f"received {Path(local).name} ({os.path.getsize(local)} bytes, {label}) via adb pull")
+    return "ok", local, digest, label
+
+
 def export_with_retry(adb, case, size, reopen, emit_log, outer_stop, on_runner,
-                      pc_name, save_dir, ensure_list, pause=None):
+                      pc_name, save_dir, ensure_list, pause=None, transport="quickshare"):
     """Run export_and_send, retrying the whole thing on a transient Quick Share failure
     (fail-transfer/noshare/pcpick). `reopen()` re-opens the chat from the list and returns
     True, or False if the chat row can't be found. Returns (status, path, digest, media).
@@ -961,7 +1181,9 @@ def export_with_retry(adb, case, size, reopen, emit_log, outer_stop, on_runner,
     writes the received file only when the transfer finishes, so a slow transfer can time out and
     then land - re-sending it would create a duplicate zip. If a new file is already here, we accept
     it instead of re-sending."""
-    base_before = bt.snapshot(save_dir) if save_dir else {}
+    use_adb = (transport == "adb")
+    base_before = bt.snapshot(save_dir) if (save_dir and not use_adb) else {}
+    phone_base = _phone_zips(adb) if use_adb else {}
     status, path, digest, media = "fail-notfound", None, None, ""
     for attempt in range(1 + SHARE_RETRIES):
         _pause_wait(pause, outer_stop)                    # honour Pause between attempts
@@ -973,13 +1195,40 @@ def export_with_retry(adb, case, size, reopen, emit_log, outer_stop, on_runner,
             # chat and stops it being retried on resume).
             emit_log("could not re-open the chat for retry - keeping the previous result")
             return status, path, digest, media
-        status, path, digest, media = export_and_send(
-            adb, case, size, emit_log=emit_log, outer_stop=outer_stop, on_runner=on_runner,
-            pc_name=pc_name, save_dir=save_dir, deadline=time.time() + MAX_SEND_SECONDS, pause=pause)
+        if use_adb:
+            status, path, digest, media = export_and_pull(
+                adb, case, size, emit_log=emit_log, outer_stop=outer_stop, on_runner=on_runner,
+                pull_dir=save_dir, deadline=time.time() + MAX_SEND_SECONDS, pause=pause)
+        else:
+            status, path, digest, media = export_and_send(
+                adb, case, size, emit_log=emit_log, outer_stop=outer_stop, on_runner=on_runner,
+                pc_name=pc_name, save_dir=save_dir, deadline=time.time() + MAX_SEND_SECONDS,
+                pause=pause)
         if (status not in SHARE_RETRY_STATUSES
                 or (outer_stop is not None and outer_stop.is_set())
                 or attempt >= SHARE_RETRIES):
             return status, path, digest, media
+        if use_adb:
+            # anti-duplicate for the adb transport: if an earlier attempt DID save the export on the
+            # phone (we just didn't see it in time), pull THAT file instead of exporting again.
+            got = _await_phone_zip(adb, phone_base, timeout=8, outer_stop=outer_stop, pause=pause)
+            if got:
+                emit_log(f"an earlier attempt's export is on the phone ({got[0]}) - pulling it "
+                         "instead of exporting again (no duplicate)")
+                try:
+                    lp = _pull_unique(adb, got[0], save_dir)
+                except Exception:
+                    lp = None
+                info = bt.zip_media_info(lp) if lp else {"ok": False}
+                if lp and info.get("ok"):
+                    try:
+                        case.record_file(Path(lp), f"whatsapp export ({info['label']}) via adb pull")
+                    except Exception:
+                        pass
+                    return "ok", lp, bt.sha256(lp), info["label"]
+            emit_log(f"{status} - retrying (attempt {attempt + 2}/{1 + SHARE_RETRIES})")
+            ensure_list()
+            continue
         # FOOLPROOF anti-duplicate: never re-send while the previous (possibly slow) transfer could
         # still be completing. Wait and watch the folder + phone; if a valid file lands, accept it.
         emit_log("verifying the previous transfer really failed before re-sending (anti-duplicate)...")
@@ -1013,8 +1262,9 @@ class WhatsAppBatch(threading.Thread):
     """
 
     def __init__(self, adb, case, size, names, order, emit, pause=None,
-                 pc_name=PC_NAME, save_dir=SAVE_DIR):
+                 pc_name=PC_NAME, save_dir=SAVE_DIR, transport="quickshare"):
         super().__init__(daemon=True)
+        self.transport = transport             # "quickshare" or "adb" (save on phone + adb pull)
         self.adb, self.case, self.size = adb, case, size
         self.names = names                    # chats to export (subset, in order)
         self.order = order                    # full scanned order (for scroll direction)
@@ -1137,7 +1387,11 @@ class WhatsAppBatch(threading.Thread):
             keep_awake(self.adb, True)
             pc_keep_awake(True)                   # keep THIS PC awake for the whole run (like the phone)
             self.emit("log", "PC sleep/screen-off suppressed for the duration of the run")
-            if not Path(self.save_dir).is_dir():
+            if self.transport == "adb":
+                os.makedirs(self.save_dir, exist_ok=True)
+                self.emit("log", f"USB transfer mode: exports are saved on the phone and pulled "
+                                 f"with adb into '{self.save_dir}' (no Quick Share)")
+            elif not Path(self.save_dir).is_dir():
                 self.emit("log", f"WARNING: save folder '{self.save_dir}' does not exist - "
                                  "received files won't be detected. Point Quick Share there.")
             self._ensure_list()
@@ -1169,7 +1423,7 @@ class WhatsAppBatch(threading.Thread):
                         self.adb, self.case, self.size, reopen,
                         lambda m: self.emit("log", f"   {m}"),
                         self._stop, self._set_runner, self.pc_name, self.save_dir, self._ensure_list,
-                        pause=self._pause)
+                        pause=self._pause, transport=self.transport)
                     if status == "fail-notfound":
                         self.emit("progress", i, total, name, "fail-notfound")
                         self.results.append((name, "fail-notfound")); continue
@@ -1286,7 +1540,7 @@ def load_progress(csv_path):
         return status, order, files, times
     with open(csv_path, newline="", encoding="utf-8", errors="replace") as f:
         for row in csv.DictReader(f):
-            nm = _csv_unsafe((row.get("chat") or "").strip())
+            nm = _norm_name(_csv_unsafe(row.get("chat") or ""))   # same identity as live reads
             if not nm:
                 continue
             if nm not in status:
@@ -1322,8 +1576,10 @@ class RollingBatch(threading.Thread):
     """
 
     def __init__(self, adb, case, size, emit, pause=None, csv_path=None,
-                 pc_name=PC_NAME, save_dir=SAVE_DIR, resume_from=None, start_from=None):
+                 pc_name=PC_NAME, save_dir=SAVE_DIR, resume_from=None, start_from=None,
+                 transport="quickshare"):
         super().__init__(daemon=True)
+        self.transport = transport             # "quickshare" or "adb" (save on phone + adb pull)
         self.adb, self.case, self.size, self.emit = adb, case, size, emit
         self._stop = threading.Event()
         self._pause = pause or threading.Event()
@@ -1532,7 +1788,7 @@ class RollingBatch(threading.Thread):
             self.adb, self.case, self.size, reopen,
             lambda m: self.emit("log", f"   {m}"),
             self._stop, self._set_runner, self.pc_name, self.save_dir, self._ensure_list,
-            pause=self._pause)
+            pause=self._pause, transport=self.transport)
         # record the media mode that was chosen even if the send later failed
         # (blank only if we never reached the with/without-media choice)
         self.files[name] = (Path(path).name if path else "", digest or "", media)
@@ -1557,7 +1813,11 @@ class RollingBatch(threading.Thread):
             keep_awake(self.adb, True)
             pc_keep_awake(True)                   # keep THIS PC awake for the whole run (like the phone)
             self.emit("log", "PC sleep/screen-off suppressed for the duration of the run")
-            if not Path(self.save_dir).is_dir():
+            if self.transport == "adb":
+                os.makedirs(self.save_dir, exist_ok=True)
+                self.emit("log", f"USB transfer mode: exports are saved on the phone and pulled "
+                                 f"with adb into '{self.save_dir}' (no Quick Share)")
+            elif not Path(self.save_dir).is_dir():
                 self.emit("log", f"WARNING: save folder '{self.save_dir}' does not exist - "
                                  "received files won't be detected. Point Quick Share there.")
             self._ensure_list()
@@ -1611,6 +1871,7 @@ class RollingBatch(threading.Thread):
             self.emit("log", f"rolling export started - CSV: {self.csv_path}")
             stale = 0
             no_new = 0            # consecutive swipes that moved but revealed nothing new
+            clip_waits = 0        # nudges spent bringing a clipped (half-visible) chat fully on screen
             loops = 0
             while not self._stop.is_set():
                 self._wait_pause()
@@ -1667,9 +1928,22 @@ class RollingBatch(threading.Thread):
                             if not sel:
                                 self.emit("row", nm, "skipped")
                     self._write_csv()
-                    todo = [nm for nm in visible if self.status.get(nm) == "pending"]
+                    # only TAP chats that are fully on screen: a row clipped at the top/bottom edge
+                    # can put the tap on the navigation bar. If the next pending chat is clipped,
+                    # nudge the list toward it first (max 2 nudges, then tap it anyway).
+                    rows = _chat_rows(_nodes(self.adb))
+                    pend = [r for r in rows if self.status.get(r["name"]) == "pending"]
+                    todo = [r["name"] for r in pend if r["full"]]
+                    if pend and not todo:
+                        clip_waits += 1
+                        if clip_waits <= 2:
+                            y = core.node_center(pend[0]["node"])[1]
+                            (self._swipe_up if y < self.size[1] // 2 else self._swipe_down)()
+                            continue
+                        todo = [pend[0]["name"]]           # fallback: never get stuck on it
                     if todo:
                         stale = 0
+                        clip_waits = 0
                         name = todo[0]
                         self._last_running = name
                         self.emit("row", name, "running")

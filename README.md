@@ -349,5 +349,17 @@ the exports). Media is embedded as base64 so the single `.html` is portable.
 
 ---
 
-## 10. License
+## 10. Tests
+A regression suite (standard library only — no phone, no installs) pins down every bug fixed so
+far; GitHub Actions runs it on every push and pull request:
+
+```
+python -m unittest discover -s tests -v
+```
+
+See [docs/RELIABILITY.md](docs/RELIABILITY.md) §10.
+
+---
+
+## 11. License
 MIT — see [LICENSE](LICENSE). No warranty. You are responsible for how you use it.
