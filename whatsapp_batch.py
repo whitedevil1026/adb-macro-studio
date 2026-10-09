@@ -89,9 +89,27 @@ BACKOUT = [
 
 
 # ----------------------------------------------------------------- screen helpers
+_NODE_CACHE = {"adb": None, "gen": None, "t": 0.0, "nodes": None}
+_NODE_TTL = 0.35          # reuse a dump only within this window AND only if no input happened since
+
+
 def _nodes(adb):
+    """Read the on-screen UI nodes (one `uiautomator dump`). A tiny cache collapses REDUNDANT
+    back-to-back reads: it returns the last dump only when (a) no input event happened since (the
+    adb input_gen is unchanged) AND (b) it is < _NODE_TTL old. Poll-and-wait loops sleep >= 0.6s
+    between reads, so they always exceed the TTL and get a FRESH dump - the cache never hides a
+    screen change they are waiting for; it only saves the duplicate dumps that used to happen within
+    a single step. uiautomator dump is the tool's #1 cost (~1-5s each), so this is a safe speedup."""
     try:
-        return core.parse_ui_nodes(adb.ui_dump())
+        gen = getattr(adb, "input_gen", None)
+        now = time.time()
+        c = _NODE_CACHE
+        if (adb is not None and c["adb"] is adb and c["gen"] == gen
+                and c["nodes"] is not None and (now - c["t"]) < _NODE_TTL):
+            return c["nodes"]
+        nodes = core.parse_ui_nodes(adb.ui_dump())
+        c.update(adb=adb, gen=gen, t=now, nodes=nodes)
+        return nodes
     except Exception:
         return []
 
@@ -687,10 +705,10 @@ def export_and_send(adb, case, size, emit_log=lambda m: None, outer_stop=None,
                          daemon=True).start()
     if qs_node is not None:
         _COORDS.setdefault(key, {})["qs"] = list(core.node_center(qs_node)); _save_coords()
-        adb.tap(*core.node_center(qs_node)); time.sleep(3.0)
+        adb.tap(*core.node_center(qs_node)); time.sleep(2.0)  # picker then polls (_wait_pc_node)
     elif cached.get("qs"):
         emit_log("share sheet unreadable - tapping Quick Share by learned position")
-        adb.tap(*cached["qs"]); time.sleep(3.0); blind = True
+        adb.tap(*cached["qs"]); time.sleep(2.0); blind = True
     else:
         _back_to_list(adb)
         return ("fail-timeout" if _left() <= 0 else "fail-noshare"), None, None, media["mode"]
@@ -702,7 +720,7 @@ def export_and_send(adb, case, size, emit_log=lambda m: None, outer_stop=None,
     pc_node = _wait_pc_node(adb, pc_name, max(2, min(25 if cached.get("pc") else 60, _left())), stop=outer_stop)
     if pc_node is not None:
         _COORDS.setdefault(key, {})["pc"] = list(core.node_center(pc_node)); _save_coords()
-        adb.tap(*core.node_center(pc_node)); time.sleep(2.0)
+        adb.tap(*core.node_center(pc_node)); time.sleep(1.5)  # transfer wait polls next
     else:
         # SAFETY: never blind-tap a learned position for the PC. The Quick Share device-picker
         # order is NOT fixed (other nearby devices come and go), so a blind tap could send the

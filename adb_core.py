@@ -513,6 +513,8 @@ class Adb:
     def __init__(self, path: str, serial: str | None = None, log=None):
         self.path, self.serial = path, serial
         self.log = log or (lambda msg: None)
+        self.input_gen = 0        # bumped on every input event; lets a UI-dump cache know the
+        #                           screen may have changed (see whatsapp_batch._nodes)
 
     def cmd(self, *args) -> list[str]:
         base = [self.path] + (["-s", self.serial] if self.serial else [])
@@ -592,23 +594,28 @@ class Adb:
             time.sleep(1.0 + attempt)             # back off (phone busy) before retrying
         raise AdbError("uiautomator dump failed after retries: " + last)
 
-    # --- input
+    # --- input  (each input bumps input_gen so a UI-dump cache knows the screen may have changed)
     def tap(self, x, y):
+        self.input_gen += 1
         self.shell("input", "tap", int(x), int(y))
 
     def swipe(self, x, y, x2, y2, ms=300):
+        self.input_gen += 1
         self.shell("input", "swipe", int(x), int(y), int(x2), int(y2), int(ms))
 
     def long_press(self, x, y, ms=800):
-        self.swipe(x, y, x, y, ms)
+        self.swipe(x, y, x, y, ms)                     # swipe() already bumps input_gen
 
     def type_text(self, s: str):
+        self.input_gen += 1
         self.shell("input", "text", escape_input_text(s))
 
     def key(self, k):
+        self.input_gen += 1
         self.shell("input", "keyevent", key_code(k))
 
     def launch(self, package: str):
+        self.input_gen += 1
         out = self.shell("monkey", "-p", package, "-c", "android.intent.category.LAUNCHER", "1")
         if "No activities found" in out or "monkey aborted" in out:
             raise AdbError(f"cannot launch {package}: {out.strip()}")
