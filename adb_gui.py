@@ -359,6 +359,11 @@ class BatchExportWindow(tk.Toplevel):
         ttk.Label(cfg, text="Save folder:").pack(side="left", padx=(10, 0))
         self.dir_var = tk.StringVar(value=wb.SAVE_DIR)
         ttk.Entry(cfg, textvariable=self.dir_var, width=26).pack(side="left", padx=4)
+        # transport: Quick Share (default) or save-on-phone + adb pull over USB (deterministic, fast,
+        # no nearby-device / "did it arrive" guessing). Files land in the Save folder either way.
+        self.adbpull_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(cfg, text="USB transfer (adb pull) instead of Quick Share",
+                        variable=self.adbpull_var).pack(side="left", padx=(10, 0))
 
         # resume / start-from controls (recover after a lock/crash without redoing work)
         cfg2 = ttk.Frame(self, padding=(6, 2))
@@ -562,7 +567,8 @@ class BatchExportWindow(tk.Toplevel):
                                      pc_name=self.pc_var.get().strip() or wb.PC_NAME,
                                      save_dir=self.dir_var.get().strip() or wb.SAVE_DIR,
                                      resume_from=resume,
-                                     start_from=startf)
+                                     start_from=startf,
+                                     transport="adb" if self.adbpull_var.get() else "quickshare")
         self.batch.scan_order = scan_order or None     # lets start-from go directionally (up/down)
         # start-from takes precedence; otherwise a selection means "export only these"
         if startf:
@@ -633,7 +639,8 @@ class BatchExportWindow(tk.Toplevel):
         self.batch = wb.WhatsAppBatch(self.app.adb, self.app.case, self.app.cur_size,
                                       names, self.order, self._emit, pause=self.pause_evt,
                                       pc_name=self.pc_var.get().strip() or wb.PC_NAME,
-                                      save_dir=self.dir_var.get().strip() or wb.SAVE_DIR)
+                                      save_dir=self.dir_var.get().strip() or wb.SAVE_DIR,
+                                      transport="adb" if self.adbpull_var.get() else "quickshare")
         self.batch.start()
 
     def stop(self):

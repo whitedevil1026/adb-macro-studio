@@ -179,23 +179,49 @@ def key_code(k) -> int:
 _BOUNDS = re.compile(r"\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]")
 
 
+# Characters illegal in XML 1.0 (control chars, lone surrogates, U+FFFE/U+FFFF) and numeric
+# references to them. ONE contact name containing such a character used to make ET.fromstring()
+# throw, so the WHOLE screen read as empty (every chat on that page vanished).
+_BAD_XML_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff￾￿]")
+_BAD_XML_REFS = re.compile(
+    r"&#(?:[xX]0*(?:[0-8bBcCeEfF]|1[0-9a-fA-F])|0*(?:[0-8]|1[124-9]|2[0-9]|3[01]));")
+_NODE_TAG = re.compile(r"<node\b([^>]*?)/?>", re.S)
+_ATTR = re.compile(r'([\w:-]+)="([^"]*)"')
+
+
+def _complete_dump(text: str) -> bool:
+    """True only for a WHOLE uiautomator dump (opening AND closing tag). A dump cut short when the
+    phone kills uiautomator must be retried - not parsed as an empty screen."""
+    return "<hierarchy" in text and "</hierarchy>" in text
+
+
+def _node_dict(get):
+    m = _BOUNDS.search(get("bounds", "") or "")
+    if not m:
+        return None
+    return {"text": get("text", "") or "", "desc": get("content-desc", "") or "",
+            "id": get("resource-id", "") or "", "cls": get("class", "") or "",
+            "pkg": get("package", "") or "", "clickable": get("clickable") == "true",
+            "bounds": tuple(map(int, m.groups()))}
+
+
 def parse_ui_nodes(xml_text: str) -> list[dict]:
     start, end = xml_text.find("<hierarchy"), xml_text.rfind("</hierarchy>")
     if start < 0 or end < 0:
         raise AdbError("uiautomator returned no UI hierarchy: " + xml_text[:200].strip())
-    root = ET.fromstring(xml_text[start:end + len("</hierarchy>")])
-    nodes = []
-    for el in root.iter("node"):
-        m = _BOUNDS.search(el.get("bounds", ""))
-        if not m:
-            continue
-        nodes.append({
-            "text": el.get("text", ""), "desc": el.get("content-desc", ""),
-            "id": el.get("resource-id", ""), "cls": el.get("class", ""),
-            "pkg": el.get("package", ""), "clickable": el.get("clickable") == "true",
-            "bounds": tuple(map(int, m.groups())),
-        })
-    return nodes
+    body = xml_text[start:end + len("</hierarchy>")]
+    body = _BAD_XML_REFS.sub("", _BAD_XML_CHARS.sub("", body))
+    try:
+        nodes = [_node_dict(el.get) for el in ET.fromstring(body).iter("node")]
+    except ET.ParseError:
+        # still malformed (odd escaping in some name): pull node attributes out by regex rather
+        # than losing every row on the screen.
+        import html
+        nodes = []
+        for m in _NODE_TAG.finditer(body):
+            attrs = {k: html.unescape(v) for k, v in _ATTR.findall(m.group(1))}
+            nodes.append(_node_dict(attrs.get))
+    return [n for n in nodes if n]
 
 
 def _area(n) -> int:
@@ -578,7 +604,7 @@ class Adb:
             try:                                  # primary: stream to stdout
                 out = self.run("exec-out", "uiautomator", "dump", "/dev/tty", timeout=30, quiet=True)
                 text = out.decode("utf-8", "replace")
-                if "<hierarchy" in text:
+                if _complete_dump(text):          # a dump cut short (process killed) is retried
                     return text
             except AdbError as e:
                 last = str(e)
@@ -587,7 +613,7 @@ class Adb:
                 self.shell("uiautomator", "dump", remote, timeout=30, quiet=True)
                 text = self.run("exec-out", "cat", remote, quiet=True).decode("utf-8", "replace")
                 self.shell("rm", "-f", remote, quiet=True)
-                if "<hierarchy" in text:
+                if _complete_dump(text):
                     return text
             except AdbError as e:
                 last = str(e)

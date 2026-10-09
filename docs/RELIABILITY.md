@@ -152,4 +152,56 @@ Warning signs and what they mean:
 3. Phone unlocked, plugged into a reliable USB port (not a hub), USB-debugging allowed.
 4. Restart WhatsApp (or the phone) before a big run so it starts with free memory — the biggest
    reduction in ANRs.
-5. Airplane mode on, Bluetooth + Wi-Fi on for Quick Share.
+5. Airplane mode on, Bluetooth + Wi-Fi on for Quick Share (or tick **USB transfer** — see §8).
+
+---
+
+## 8. USB transfer mode (`adb pull`) — removing the root cause
+
+Most field bugs (false "failed", retries, duplicates, slowness) shared one root cause: **Quick Share
+gives no ground truth.** The PC file is written atomically at the very end (nothing visible
+mid-transfer), the phone's screen lists every nearby device, and over Bluetooth it is slow — so
+"did it arrive?" had to be *inferred from timing*.
+
+Ticking **"USB transfer (adb pull) instead of Quick Share"** removes that channel: the export is
+saved to the phone's own storage via the share sheet's **Save to Files / My Files / Files** target,
+and the tool `adb pull`s the **exact** file over USB into the Save folder.
+
+- Deterministic: the tool knows precisely which file it saved — no guessing, no nearby devices.
+- Fast: USB is far quicker than Bluetooth.
+- No duplicates: before any retry it checks whether an earlier attempt already saved the export on
+  the phone, and pulls that instead of exporting again. A pulled file never overwrites an existing
+  one (`name (1).zip`, ...).
+- First run only: if the save target isn't readable on your phone, the log says
+  **ACTION NEEDED: tap your 'Save to Files' / 'My Files' share target** — tap it once on the phone;
+  your tap does the action *and* teaches the position for every following chat (same for the
+  Save/Done confirmation, if your file manager shows one).
+
+Note: in this mode a copy of each export also stays in the phone's Download/Documents folder.
+
+## 9. Screen reading — what makes it robust
+
+Every decision the tool makes starts from a `uiautomator` screen dump. It is hardened against the
+failure modes seen in the field:
+
+| Failure mode | Protection |
+|---|---|
+| Dump cut short when the busy phone kills `uiautomator` | only a **complete** dump (opening *and* closing tag) is accepted; otherwise retried |
+| One odd character in one contact name blanked the whole screen | illegal XML characters are stripped; if the XML is still malformed, nodes are extracted by a fallback parser |
+| Chat name only in `content-desc` | names are read from text **or** content-desc |
+| Half-visible row at a screen edge | only fully visible rows are tapped; the list is nudged first |
+| Same chat reading as two names | invisible direction marks removed anywhere, all whitespace unified, Unicode-normalized |
+| Redundant back-to-back dumps (slow) | a 0.35 s cache, invalidated by any tap/swipe/key, so waits still see every change |
+
+## 10. Regression tests — keeping fixed bugs fixed
+
+`tests/test_regressions.py` holds one test per bug that has hit this tool in the field. They run
+with the standard library only (no phone, no installs):
+
+```
+python -m unittest discover -s tests -v
+```
+
+GitHub Actions (`.github/workflows/tests.yml`) runs them on every push and pull request. Each test
+was verified by **re-injecting the original bug** and confirming the test fails — so a future change
+that brings a bug back is caught before it reaches a phone.
