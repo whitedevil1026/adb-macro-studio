@@ -98,6 +98,28 @@ def run_accept(windows, timeout=10, exe_paths=(), launched=None):
     return clicked, logs
 
 
+# ----------------------------------------------------------------- nothing written to the phone
+class TestScreenReadsWriteNothingOnThePhone(unittest.TestCase):
+    """A failed screen read used to fall back to `uiautomator dump /sdcard/window_dump.xml` - a file
+    written on the (evidence) phone. Retrying the stdout read is enough and writes nothing."""
+
+    def test_a_failed_read_is_retried_without_writing_a_file_on_the_phone(self):
+        xml = b"<?xml version='1.0' ?><hierarchy rotation='0'><node text='' bounds='[0,0][1,1]'/></hierarchy>"
+        calls = []
+        replies = [core.AdbError("killed (exit 137)"), b"<hierarchy", xml]   # killed, cut short, ok
+
+        def run(self, *args, **k):
+            calls.append(args)
+            r = replies.pop(0)
+            if isinstance(r, Exception):
+                raise r
+            return r
+        with mock.patch.object(core.Adb, "run", run), mock.patch.object(core.time, "sleep", lambda s: None):
+            out = core.Adb("adb", SERIAL).ui_dump()
+        self.assertIn("</hierarchy>", out)
+        self.assertFalse([c for c in calls if any("/sdcard" in str(a) for a in c)], calls)
+
+
 # ----------------------------------------------------------------- one Accept watcher per run
 class TestAcceptWatcher(unittest.TestCase):
     """A long run used to start a NEW 180-second UI-polling thread for every chat attempt; on failures

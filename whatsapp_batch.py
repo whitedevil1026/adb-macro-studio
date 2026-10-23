@@ -8,7 +8,6 @@ live progress; nothing here touches Tkinter.
 """
 from __future__ import annotations
 
-import copy
 import csv
 import json
 import os
@@ -300,14 +299,19 @@ def fully_visible_chats(adb):
     return {r["name"] for r in _chat_rows(_nodes(adb)) if r["full"]}
 
 
-def _find_chat_node(adb, name):
-    """The on-screen node for `name`, preferring a fully visible (un-clipped) row."""
+def _chat_node_in(nodes, name):
+    """The node for chat `name` among `nodes`, preferring a fully visible (un-clipped) row."""
     key = _norm_name(name).lower()
-    hits = [r for r in _chat_rows(_nodes(adb)) if r["name"].lower() == key]
+    hits = [r for r in _chat_rows(nodes) if r["name"].lower() == key]
     if not hits:
         return None
     hits.sort(key=lambda r: not r["full"])          # full rows first
     return hits[0]["node"]
+
+
+def _find_chat_node(adb, name):
+    """The on-screen node for `name`, preferring a fully visible (un-clipped) row."""
+    return _chat_node_in(_nodes(adb), name)
 
 
 def on_chat_list(adb):
@@ -1558,218 +1562,7 @@ def export_with_retry(adb, case, size, reopen, emit_log, outer_stop, on_runner,
     return status, path, digest, media
 
 
-# ----------------------------------------------------------------- batch thread
-class WhatsAppBatch(threading.Thread):
-    """emit(kind, *args):
-        ("progress", index, total, name, status)   status: running/ok/fail-*/skipped
-        ("log", msg)
-        ("finished", {"last": <name or None>, "results": [(name, status), ...]})
-    """
-
-    def __init__(self, adb, case, size, names, order, emit, pause=None,
-                 pc_name=PC_NAME, save_dir=SAVE_DIR, package=None):
-        super().__init__(daemon=True)
-        self.adb, self.case, self.size = adb, case, size
-        if package:
-            adb.wa_package = package          # the WhatsApp app this run drives
-        self.names = names                    # chats to export (subset, in order)
-        self.order = order                    # full scanned order (for scroll direction)
-        self.emit = emit
-        self._stop = threading.Event()
-        self._pause = pause or threading.Event()   # set = paused
-        self._runner = None                        # current inner export runner
-        self.pc_name, self.save_dir = pc_name, save_dir
-        self.files = {}                            # name -> (filename, sha256, media)
-        self.times = {}                            # name -> ISO time the row became terminal
-        self.csv_path = str(Path(case.dir) / csv_name(package))
-        self.last_done = None
-        self.results = []
-
-    def _write_csv(self):
-        now = core.now_iso()
-        rows = []
-        for i, (nm, st) in enumerate(self.results, 1):
-            self.times.setdefault(nm, now)   # stamp on first write = completion time
-            fn, digest, media = self.files.get(nm, ("", "", ""))
-            if not media and st.startswith("fail"):
-                media = "not exported"       # chat never opened -> no media choice made
-            rows.append([i, _csv_safe(nm), st, media, _csv_safe(fn), digest, self.times[nm]])
-        write_csv_atomic(self.csv_path, rows, lambda m: self.emit("log", m))
-
-    def stop(self):
-        self._stop.set()
-        r = self._runner
-        if r:
-            try:
-                r.stop()
-            except Exception:
-                pass
-
-    def _set_runner(self, r):
-        self._runner = r
-
-    def _wait_pause(self):
-        was = self._pause.is_set()
-        if was:
-            self.emit("log", "paused")
-        while self._pause.is_set() and not self._stop.is_set():
-            time.sleep(0.2)
-        if was and not self._stop.is_set():
-            self.emit("log", "resumed")
-
-    # --- device / list guards
-    def _device_ready(self):
-        try:
-            return any(d["state"] == "device" for d in core.Adb(self.adb.path).devices())
-        except Exception:
-            return False
-
-    def _wait_device(self, timeout=180):
-        end = time.time() + timeout
-        said = None
-        while time.time() < end and not self._stop.is_set():
-            if self._device_ready():
-                if said is not None:
-                    self.emit("log", "device is ready")
-                return True
-            # explain WHY we're waiting (so "stuck in initialisation" is never a mystery)
-            msg = _device_wait_reason(self.adb.path)
-            if msg != said:
-                self.emit("log", msg)
-                said = msg
-            time.sleep(2)
-        return False
-
-    def _ensure_list(self):
-        for _ in range(8):
-            if dismiss_anr(self.adb):                 # clear an ANR dialog that blocks the list
-                time.sleep(1.2)
-            st = on_chat_list(self.adb)
-            if st:
-                return True
-            if st is None:                # unreadable: retry, don't BACK out of WhatsApp
-                time.sleep(1.0); continue
-            self.adb.key("BACK"); time.sleep(1.2)
-        return bool(on_chat_list(self.adb))
-
-    def _swipe_down(self):
-        w, h = self.size
-        cx, cy = w // 2, h // 2
-        off = int(h * 0.06)                    # gentle, no-fling drag (consistent with the rest)
-        self.adb.swipe(cx, cy + off, cx, cy - off, 1200); time.sleep(0.7)
-
-    def _swipe_up(self):
-        w, h = self.size
-        cx, cy = w // 2, h // 2
-        off = int(h * 0.06)
-        self.adb.swipe(cx, cy - off, cx, cy + off, 1200); time.sleep(0.7)
-
-    def _scroll_to(self, name, max_steps=120):
-        """Scroll toward `name` using the known order; recover from overshoot."""
-        ti = self.order.index(name) if name in self.order else None
-        for _ in range(max_steps):
-            if self._stop.is_set():
-                return None
-            self._wait_pause()
-            node = _find_chat_node(self.adb, name)
-            if node:
-                return node
-            vis = [nm for _, nm in visible_chats(self.adb)]
-            idxs = [self.order.index(nm) for nm in vis if nm in self.order]
-            if ti is None or not idxs:
-                self._swipe_down()                      # no info: scan downward
-            elif max(idxs) < ti:
-                self._swipe_down()                      # target is below the view
-            elif min(idxs) > ti:
-                self._swipe_up()                        # overshot: target is above
-            else:
-                self._swipe_down()                      # target within range but hidden: nudge
-        return None
-
-    def run(self):
-        try:
-            if not self._device_ready() and not self._wait_device():
-                self.emit("finished", {"last": None, "results": []}); return
-            keep_awake(self.adb, True)
-            pc_keep_awake(True)                   # keep THIS PC awake for the whole run (like the phone)
-            self.emit("log", "PC sleep/screen-off suppressed for the duration of the run")
-            if not Path(self.save_dir).is_dir():
-                self.emit("log", f"WARNING: save folder '{self.save_dir}' does not exist - "
-                                 "received files won't be detected. Point Quick Share there.")
-            self._ensure_list()
-            total = len(self.names)
-            for i, name in enumerate(self.names, 1):
-                if self._stop.is_set():
-                    self.emit("log", "stopped by user"); break
-                self._wait_pause()
-                if self._stop.is_set():
-                    break
-                self.emit("progress", i, total, name, "running")
-                try:
-                    if not self._device_ready():
-                        self.emit("log", "device disconnected - waiting up to 180s")
-                        if not self._wait_device():
-                            self.emit("progress", i, total, name, "fail-device")
-                            self.results.append((name, "fail-device")); break
-                        time.sleep(2)
-                    if not self._ensure_list():
-                        self.emit("progress", i, total, name, "fail-nolist")
-                        self.results.append((name, "fail-nolist")); continue
-                    def reopen():
-                        node = self._scroll_to(name)
-                        if not node:
-                            return False
-                        self.adb.tap(*core.node_center(node)); time.sleep(1.4)
-                        return True
-                    status, path, digest, media = export_with_retry(
-                        self.adb, self.case, self.size, reopen,
-                        lambda m: self.emit("log", f"   {m}"),
-                        self._stop, self._set_runner, self.pc_name, self.save_dir, self._ensure_list,
-                        pause=self._pause)
-                    if status == "fail-notfound":
-                        self.emit("progress", i, total, name, "fail-notfound")
-                        self.results.append((name, "fail-notfound")); continue
-                    # record the media mode that was chosen even if the send later failed
-                    # (blank only if we never reached the with/without-media choice)
-                    self.files[name] = (Path(path).name if path else "", digest or "", media)
-                    if not self._stop.is_set():
-                        _back_to_list(self.adb)      # guarantee we're off the share sheet/picker
-                    if self._stop.is_set():
-                        self.emit("progress", i, total, name, "stopped"); break
-                    self.emit("progress", i, total, name, status)
-                    self.results.append((name, status))
-                    if status == "ok":
-                        self.last_done = name
-                    self._write_csv()
-                except core.AdbError as e:
-                    self.emit("log", f"adb error (likely disconnect): {e}")
-                    self.emit("progress", i, total, name, "fail-adb")
-                    self.results.append((name, "fail-adb"))
-                    self._wait_device()
-                    try:
-                        self._ensure_list()
-                    except core.AdbError:
-                        pass
-                except Exception as e:
-                    # one chat's unexpected error must not abort the whole selected-export run
-                    self.emit("log", f"unexpected error on {name!r} (continuing): {e!r}")
-                    self.emit("progress", i, total, name, "fail-error")
-                    self.results.append((name, "fail-error"))
-                    try:
-                        self._ensure_list()
-                    except Exception:
-                        pass
-        finally:
-            pc_keep_awake(False)       # release the PC sleep/display lock
-            try:
-                keep_awake(self.adb, False)
-            except Exception:
-                pass
-            self._write_csv()          # guarantee the final state (incl. a last failure) is saved
-            self.emit("finished", {"last": self.last_done, "results": self.results})
-
-
-# ----------------------------------------------------------------- CSV helpers
+# ----------------------------------------------------------------- evidence CSV
 def _csv_safe(v):
     """Neutralise spreadsheet formula injection from chat names/filenames."""
     s = "" if v is None else str(v)
@@ -2338,13 +2131,7 @@ class RollingBatch(threading.Thread):
 
     def _export_one(self, name):
         def reopen():
-            key = _norm_name(name).lower()
-
-            def find(nodes):
-                hits = [r for r in _chat_rows(nodes) if r["name"].lower() == key]
-                hits.sort(key=lambda r: not r["full"])          # full rows first
-                return hits[0]["node"] if hits else None
-            node = _settled_node(self.adb, find)
+            node = _settled_node(self.adb, lambda nodes: _chat_node_in(nodes, name))
             if not node:
                 return False
             self.adb.tap(*core.node_center(node)); time.sleep(1.4)

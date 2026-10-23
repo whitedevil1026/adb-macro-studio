@@ -1245,7 +1245,9 @@ class App:
                     if msg:
                         self.q.put(("log", msg))
                 except Exception as e:
-                    msg = streak.fail(f"live view paused (retrying quietly): {e}")
+                    msg = streak.fail(f"live view paused - the phone is not answering ({e}). If it was "
+                                      "unplugged: reconnect the USB cable, unlock it, press Refresh "
+                                      "and Connect. Retrying quietly.")
                     if msg:
                         self.q.put(("log", msg))
                     self._live_stop.wait(2.0)

@@ -724,26 +724,19 @@ class Adb:
         png_size(data)
         return data
 
-    def ui_dump(self, retries=3) -> str:
-        """UI hierarchy XML. Tries stdout first (writes nothing on the phone). Retries with
+    def ui_dump(self, retries=5) -> str:
+        """UI hierarchy XML, streamed to stdout - nothing is ever written on the phone (there used
+        to be a fallback that dumped to /sdcard/window_dump.xml on a busy phone). Retries with
         backoff because uiautomator can be SIGKILLed (exit 137) when the phone is busy
         (e.g. preparing a media export)."""
         last = ""
         for attempt in range(retries):
-            try:                                  # primary: stream to stdout
+            try:
                 out = self.run("exec-out", "uiautomator", "dump", "/dev/tty", timeout=30, quiet=True)
                 text = out.decode("utf-8", "replace")
                 if _complete_dump(text):          # a dump cut short (process killed) is retried
                     return text
-            except AdbError as e:
-                last = str(e)
-            try:                                  # fallback: dump to a file, read it back
-                remote = "/sdcard/window_dump.xml"
-                self.shell("uiautomator", "dump", remote, timeout=30, quiet=True)
-                text = self.run("exec-out", "cat", remote, quiet=True).decode("utf-8", "replace")
-                self.shell("rm", "-f", remote, quiet=True)
-                if _complete_dump(text):
-                    return text
+                last = "incomplete dump"
             except AdbError as e:
                 last = str(e)
             time.sleep(1.0 + attempt)             # back off (phone busy) before retrying
